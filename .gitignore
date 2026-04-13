@@ -1,0 +1,11 @@
+# Node.js example
+node_modules/
+.env
+*.log
+
+# Python example
+__pycache__/
+*.pyc
+venv/
+.env
+.env.example

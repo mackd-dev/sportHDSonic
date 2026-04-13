@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+motor
+pydantic
+pydantic-settings
+python-jose[cryptography]
+python-multipart
+python-dotenv
+httpx
+beautifulsoup4
+lxml
+
+# 🔐 AUTH (PINNED — CRITICAL)
+passlib==1.7.4
+bcrypt==3.2.2
