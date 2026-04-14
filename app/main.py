@@ -229,10 +229,10 @@ pwd_context = CryptContext(
 security = HTTPBearer()
 
 # ✅ SONICPESA CONFIGURATION
-SONICPESA_API_KEY = os.getenv("SONICPESA_API_KEY")
-SONICPESA_SECRET_KEY = os.getenv("SONICPESA_SECRET_KEY")
-SONICPESA_WEBHOOK_URL = os.getenv("SONICPESA_WEBHOOK_URL")
-SONICPESA_BASE_URL = (os.getenv("SONICPESA_BASE_URL") or "https://api.sonicpesa.com/api/v1").rstrip("/")
+SONICPESA_API_KEY = os.getenv("SONICPESA_API_KEY")  # X-API-KEY header
+SONICPESA_WEBHOOK_URL = os.getenv("SONICPESA_WEBHOOK_URL")  # Optional override if Sonic supports per-request webhooks
+SONICPESA_SECRET_KEY = os.getenv("SONICPESA_SECRET_KEY")  # For X-SonicPesa-Signature verification
+SONICPESA_BASE_URL = os.getenv("SONICPESA_BASE_URL", "https://api.sonicpesa.com/api/v1")
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
@@ -435,8 +435,8 @@ async def maybe_auto_expire_premium(device: dict) -> dict:
     if not device:
         return device
 
-    is_premium = device.get("isPremium", False)
-    premium_until = device.get("premiumUntil")
+    is_premium = device.get("isPremium") or device.get("is_premium") or False
+    premium_until = device.get("premiumUntil") or device.get("premium_until")
     now = datetime.utcnow()
 
     if is_premium and premium_until and premium_until <= now:
@@ -912,143 +912,42 @@ async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(
         logger.error(f"❌ Admin Auth Failed: {str(e)}")
         raise HTTPException(401, "Invalid or expired admin token")
 
-# ✅ SONICPESA WEBHOOK VERIFICATION + PAYMENT HELPERS
-def verify_sonicpesa_signature(payload_raw: bytes, signature: str) -> bool:
-    """Verify SonicPesa webhook signature using HMAC SHA256."""
+# ✅ SONICPESA SIGNATURE VERIFICATION
+def verify_sonicpesa_signature(payload_raw: bytes, signature: str | None) -> bool:
+    """
+    Verify SonicPesa webhook signature if SONICPESA_SECRET_KEY is configured.
+    Returns True if verification is disabled or the signature matches.
+    """
     if not SONICPESA_SECRET_KEY:
-        logger.error("❌ SONICPESA_SECRET_KEY is not configured")
-        return False
+        logger.warning("⚠️ SONICPESA_SECRET_KEY not set - webhook signature verification disabled")
+        return True
 
     if not signature:
         logger.error("❌ Missing X-SonicPesa-Signature header")
         return False
 
-    expected = hmac.new(
-        SONICPESA_SECRET_KEY.encode("utf-8"),
-        payload_raw,
-        hashlib.sha256
-    ).hexdigest()
-
+    expected = hmac.new(SONICPESA_SECRET_KEY.encode(), payload_raw, hashlib.sha256).hexdigest()
     is_valid = hmac.compare_digest(expected, signature.strip())
     if not is_valid:
-        logger.error("❌ Invalid SonicPesa webhook signature")
+        logger.error(f"❌ SonicPesa signature mismatch. Expected: {expected}, Got: {signature}")
     return is_valid
 
 
-def map_sonicpesa_status(raw_status: Optional[str]) -> str:
-    status = (raw_status or "").strip().upper()
-    if status == "SUCCESS":
-        return "COMPLETED"
-    if status in {"PENDING", "INPROGRESS"}:
-        return "PENDING"
-    if status in {"CANCELLED", "USERCANCELLED", "REJECTED"}:
-        return "FAILED"
-    return "PENDING"
-
-
-def extract_sonicpesa_gateway_status(payload: dict) -> str:
-    if not isinstance(payload, dict):
-        return ""
-
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    transaction = payload.get("transaction") if isinstance(payload.get("transaction"), dict) else {}
-
-    candidates = [
-        payload.get("payment_status"),
-        payload.get("status"),
-        data.get("payment_status"),
-        data.get("status"),
-        transaction.get("status"),
-    ]
-
-    for candidate in candidates:
-        if candidate:
-            return str(candidate).upper()
-    return ""
-
-
-async def find_payment_by_order_id(order_id: str):
-    cursor = payments_col.find({
-        "$or": [{"orderId": order_id}, {"order_id": order_id}]
-    }).sort("createdAt", -1)
-    payments = await cursor.to_list(length=1)
-    return payments[0] if payments else None
-
-
-async def get_package_doc_for_payment(payment: dict):
-    config = await config_col.find_one({"name": "global"}) or {}
-    pkg_id = payment.get("package")
-    return next(
-        (p for p in config.get("packages", []) if str(p.get("id")) == str(pkg_id)),
-        None
-    )
-
-
-async def complete_payment_and_upgrade_user(payment: dict, gateway_payload: Optional[dict] = None, source: str = "sonic"):
-    """Apply the existing upgrade business logic without changing the subscription flow."""
-    if payment.get("status") == "COMPLETED":
-        return payment
-
-    now = datetime.utcnow()
-    package_doc = await get_package_doc_for_payment(payment)
-    duration_td = _duration_td_from_package_or_payment(package_doc, payment)
-    duration_seconds = int(duration_td.total_seconds())
-    duration_days = max(1, int((duration_seconds + 86399) // 86400))
-
-    uuid_ = payment["uuid"]
-    device = await devices_col.find_one({"uuid": uuid_})
-
-    if device and device.get("isPremium") and device.get("premiumUntil"):
-        current_expiry = device["premiumUntil"]
-        base_date = max(current_expiry, now)
-        premium_until = base_date + duration_td
-    else:
-        premium_until = now + duration_td
-
-    await devices_col.update_one(
-        {"uuid": uuid_},
-        {"$set": {
-            "isPremium": True,
-            "premiumUntil": premium_until,
-            "currentPackage": payment.get("package"),
-            "trialRemaining": 0,
-            "trialUsed": True,
-            "upgradedAt": now
-        }}
-    )
-
-    payment_update = {
-        "status": "COMPLETED",
-        "duration_seconds": duration_seconds,
-        "durationSeconds": duration_seconds,
-        "duration_days": duration_days,
-        "durationDays": duration_days,
-        "updatedAt": now,
-        "completion_source": source,
-        "processing": False,
+def normalize_gateway_payment_status(raw_status: Optional[str]) -> str:
+    value = (raw_status or "").strip().upper()
+    mapping = {
+        "SUCCESS": "COMPLETED",
+        "COMPLETED": "COMPLETED",
+        "PENDING": "PENDING",
+        "INPROGRESS": "PROCESSING",
+        "PROCESSING": "PROCESSING",
+        "CANCELLED": "CANCELLED",
+        "USERCANCELLED": "CANCELLED",
+        "REJECTED": "FAILED",
+        "FAILED": "FAILED",
+        "ERROR": "FAILED",
     }
-
-    payload = gateway_payload or {}
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    if payload:
-        payment_update["webhook_payload"] = payload
-    if payload.get("reference") or data.get("reference"):
-        payment_update["reference"] = payload.get("reference") or data.get("reference")
-    if payload.get("transid") or data.get("transid"):
-        payment_update["transid"] = payload.get("transid") or data.get("transid")
-    if payload.get("channel") or data.get("channel"):
-        payment_update["channel"] = payload.get("channel") or data.get("channel")
-    if extract_sonicpesa_gateway_status(payload):
-        payment_update["gateway_status"] = extract_sonicpesa_gateway_status(payload)
-
-    await payments_col.update_one(
-        {"_id": payment["_id"]},
-        {"$set": payment_update}
-    )
-
-    payment.update(payment_update)
-    payment["premiumUntil"] = premium_until
-    return payment
+    return mapping.get(value, value or "PENDING")
 
 def extract_channel_id_from_url(url: str) -> Optional[str]:
     """Extract channel ID from player.php?c=X URL"""
@@ -1302,8 +1201,6 @@ async def startup():
     global channel_scheduler
     # 🟡 Existing indexes
     await payments_col.create_index("order_id")
-    await payments_col.create_index("orderId")
-    await payments_col.create_index("internal_payment_id")
     await payments_col.create_index("status")
     await devices_col.create_index("uuid", unique=True)
     
@@ -1311,12 +1208,11 @@ async def startup():
     if not SONICPESA_API_KEY:
         logger.error("❌ SONICPESA_API_KEY not set!")
     if not SONICPESA_SECRET_KEY:
-        logger.error("❌ SONICPESA_SECRET_KEY not set!")
+        logger.warning("⚠️ SONICPESA_SECRET_KEY not set - webhook verification disabled")
     if not SONICPESA_WEBHOOK_URL:
-        logger.warning("⚠️ SONICPESA_WEBHOOK_URL not set - remember to configure it in SonicPesa dashboard")
+        logger.warning("⚠️ SONICPESA_WEBHOOK_URL not set - configure webhook URL in SonicPesa dashboard")
     else:
         logger.info(f"✅ SonicPesa webhook URL configured: {SONICPESA_WEBHOOK_URL}")
-    logger.info(f"✅ SonicPesa base URL: {SONICPESA_BASE_URL}")
 
     # ✅ START THE BACKGROUND TASK
     asyncio.create_task(subscription_cleanup_task())
@@ -1550,13 +1446,20 @@ async def device_status(uuid: str):
     # ✅ FIX: Use centralized expiry logic
     device = await maybe_auto_expire_premium(device)
 
+    # ✅ SAFETY: Explicit type checking for isPremium
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+
     # If trial is exhausted, ensure it's 0
     trial_remaining = device.get("trialRemaining", 0)
     if device.get("trialUsed", False) and trial_remaining <= 0:
         trial_remaining = 0
 
     return {
-        "isPremium": device.get("isPremium", False),
+        "isPremium": is_premium,
         "trialRemaining": trial_remaining
     }
 
@@ -1586,12 +1489,19 @@ async def get_entitlement(x_device_id: str = Header(None)):
         # ✅ NEW: Check if Premium has expired when checking entitlement
         device = await maybe_auto_expire_premium(device)
     
+    # ✅ SAFETY: Explicit type checking for isPremium
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+    
     # Check if trial was already used (one-time enforcement)
     trial_used = device.get("trialUsed", False)
     trial_remaining = device.get("trialRemaining", 0)
     
     return {
-        "isPremium": device.get("isPremium", False),
+        "isPremium": is_premium,
         "subscriptionExpiresAt": int(device["premiumUntil"].timestamp() * 1000) if device.get("premiumUntil") else None,
         "trialRemainingSeconds": trial_remaining,
         "trialUsed": trial_used,  # Inform app if trial was already used
@@ -1630,8 +1540,8 @@ async def start_session(payload: dict, request: Request):
         raise HTTPException(503, "Maintenance")
 
     # Trial / Premium check
-    is_premium = device.get("isPremium", False)
-    premium_until = device.get("premiumUntil")
+    is_premium = device.get("isPremium") or device.get("is_premium") or False
+    premium_until = device.get("premiumUntil") or device.get("premium_until")
     trial_remaining = device.get("trialRemaining", 0)
     trial_used = device.get("trialUsed", False)
     
@@ -1687,7 +1597,29 @@ async def start_session(payload: dict, request: Request):
     channel = Channel(**channel_doc)
 
     # 🔥 TRIAL LOGIC: Only apply trial to PREMIUM channels for non-premium users
-    if not is_premium and channel.is_premium:
+    # Force-sync the user's premium status before checking the paywall
+    
+    # ✅ SAFETY FIX #1: Explicit type checking for isPremium (handle string "true")
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        user_is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        user_is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+    
+    premium_until_value = device.get("premiumUntil") or device.get("premium_until")
+    now_check = datetime.utcnow()
+    
+    # ✅ SAFETY FIX #2: Double-check that premium subscription is still active
+    if user_is_premium and premium_until_value:
+        if isinstance(premium_until_value, datetime) and premium_until_value <= now_check:
+            logger.warning(f"Premium expired in /session/start for {uuid_}")
+            user_is_premium = False
+    
+    # ✅ FIX: If user is premium, they should NOT be treated as a trial user
+    # Ensure channelIsPremium is FALSE for premium users so the app doesn't start the timer
+    effective_channel_is_premium = channel.is_premium and not user_is_premium
+
+    if channel.is_premium and not user_is_premium:
         # Check if trial was ALREADY used up completely
         if trial_used and trial_remaining <= 0:
             # Trial is exhausted - BLOCK ACCESS
@@ -1907,8 +1839,8 @@ async def start_session(payload: dict, request: Request):
             "drm_type": "NONE",
             "drm_data": None,                                 # 🔥 PATCH 1: Add drm_data for app compatibility
             "headers": channel.headers,
-            "trialRemaining": trial_remaining,                # ✅ Add trial remaining
-            "channelIsPremium": channel.is_premium            # ✅ CRITICAL: Pass channel premium status
+            "trialRemaining": 0 if user_is_premium else trial_remaining,                # ✅ Add trial remaining
+            "channelIsPremium": effective_channel_is_premium            # ✅ CRITICAL: Pass channel premium status
         }
 
     elif stream_type == "DASH":
@@ -1934,8 +1866,8 @@ async def start_session(payload: dict, request: Request):
             "player_mode": flags.get("playerMode", "EXO"),   
             "drm_type": (channel.drm_type or "NONE").upper(),  # Normalize to uppercase
             "headers": channel.headers or {},  # Never null
-            "trialRemaining": trial_remaining,                
-            "channelIsPremium": channel.is_premium or False  # Never null
+            "trialRemaining": 0 if user_is_premium else trial_remaining,                
+            "channelIsPremium": effective_channel_is_premium  # Never null
         }
         
         # 🔥 PATCH 4: For ClearKey, include drm_data (ALWAYS for app compatibility)
@@ -3129,51 +3061,82 @@ async def session_heartbeat(payload: dict):
     if not device:
         raise HTTPException(404, "Device not found")
     
-    # ✅ FIX: Check if Premium has expired MID-STREAM
-    is_premium = device.get("isPremium", False)
-    premium_until = device.get("premiumUntil")
+    # ============================================================================
+    # 🔥 CRITICAL FIX: Proper Premium User Handling with Type Safety
+    # ============================================================================
     now = datetime.utcnow()
+    
+    # ✅ FIX #1: Explicit boolean type checking (handle string "true"/"false")
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+    
+    premium_until = device.get("premiumUntil") or device.get("premium_until")
+    
+    logger.info(f"🔍 Heartbeat Debug | uuid={uuid_} | is_premium={is_premium} | premium_until={premium_until}")
 
+    # ============================================================================
+    # PREMIUM USER VALIDATION
+    # ============================================================================
     if is_premium:
-        if premium_until and premium_until <= now:
-            logger.info(f"🚫 Premium expired mid-stream for {uuid_}")
-
-            TRIAL_AFTER_DOWNGRADE = 5
-
-            # ✅ Downgrade immediately + restore trial seconds to DB
-            await devices_col.update_one(
-                {"uuid": uuid_},
-                {"$set": {
+        # Validate that premium subscription is still active
+        if premium_until and isinstance(premium_until, datetime):
+            if premium_until <= now:
+                logger.warning(f"🚫 Premium subscription EXPIRED for {uuid_} | expired_at={premium_until}")
+                
+                TRIAL_AFTER_DOWNGRADE = 5
+                
+                # ✅ Downgrade immediately + restore trial seconds to DB
+                await devices_col.update_one(
+                    {"uuid": uuid_},
+                    {"$set": {
+                        "isPremium": False,
+                        "premiumUntil": None,
+                        "currentPackage": None,
+                        "trialRemaining": TRIAL_AFTER_DOWNGRADE,
+                        "trialUsed": False,
+                        "trialPausedAt": None,
+                        "lastChannelId": None,
+                        "downgradedAt": now
+                    }}
+                )
+                
+                logger.info(f"✅ Downgraded user {uuid_} and restored 5s trial")
+                
+                # Return trial seconds so app can continue
+                return {
+                    "success": True,
+                    "action": "CONTINUE",
                     "isPremium": False,
-                    "premiumUntil": None,
-                    "currentPackage": None,
                     "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-                    "trialUsed": False,
-                    "trialPausedAt": None,
-                    "lastChannelId": None,
-                    "downgradedAt": now
-                }}
-            )
-
-            # ✅ Return trial seconds so app can continue / show countdown (prevents black screen)
+                    "message": "Subscription expired. Trial started."
+                }
+            else:
+                # ✅ Premium is still valid - RETURN IMMEDIATELY
+                logger.info(f"✅ Premium VALID for {uuid_} | expires={premium_until}")
+                return {
+                    "success": True,
+                    "action": "CONTINUE",
+                    "isPremium": True,
+                    "trialRemaining": 0  # Premium users have NO trial counter
+                }
+        else:
+            # ✅ Premium is True but no expiry date found - GRANT ACCESS
+            # This shouldn't happen, but treat as valid premium to be safe
+            logger.warning(f"⚠️ Premium=true but missing premiumUntil for {uuid_} - granting access")
             return {
                 "success": True,
                 "action": "CONTINUE",
-                "isPremium": False,
-                "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-                "message": "Subscription expired. Trial started."
+                "isPremium": True,
+                "trialRemaining": 0
             }
 
-        # User is valid premium
-        return {
-            "success": True,
-            "action": "CONTINUE",
-            "isPremium": True,
-            "trialRemaining": 0
-        }
-
-    # ✅ (Strongly recommended) Patch 3 — If any free user hits 0, snap back to 5
-    if not device.get("isPremium", False):
+    # ============================================================================
+    # FREE USER TRIAL LOGIC (Only for non-premium users)
+    # ============================================================================
+    if not is_premium:
         remaining = int(device.get("trialRemaining") or 0)
         if remaining <= 0:
             TRIAL_AFTER_DOWNGRADE = 5
@@ -3182,13 +3145,13 @@ async def session_heartbeat(payload: dict):
                 {"$set": {"trialRemaining": TRIAL_AFTER_DOWNGRADE, "trialUsed": False, "trialPausedAt": None}}
             )
             remaining = TRIAL_AFTER_DOWNGRADE
-            # Update device dict so subsequent logic uses the new value
             device["trialRemaining"] = remaining
             device["trialUsed"] = False
+            logger.info(f"🔄 Reset trial for free user {uuid_} to 5s")
 
-    # --- BELOW IS EXISTING FREE/TRIAL LOGIC (UNCHANGED) ---
-    
-    # We need to know if the current session is for a premium channel
+    # ============================================================================
+    # CHECK IF WATCHING PREMIUM CHANNEL (Only matters for free users)
+    # ============================================================================
     last_channel_id = device.get("lastChannelId")
     is_watching_premium = False
     
@@ -3196,12 +3159,27 @@ async def session_heartbeat(payload: dict):
         channel = await channels_col.find_one({"id": last_channel_id})
         if channel and channel.get("is_premium"):
             is_watching_premium = True
+            logger.info(f"📺 User {uuid_} watching premium channel {last_channel_id}")
+    
+    # ✅ FIX #2: Premium users should NEVER hit trial/paywall logic
+    # Double-check that premium users don't continue to trial logic
+    if is_premium:
+        logger.warning(f"🚨 SAFETY BREACH: Premium user {uuid_} reached trial logic section! Returning CONTINUE.")
+        return {
+            "success": True,
+            "action": "CONTINUE",
+            "isPremium": True,
+            "trialRemaining": 0
+        }
     
     if is_watching_premium:
         trial_remaining = device.get("trialRemaining", 0)
         trial_used = device.get("trialUsed", False)
         
+        logger.info(f"⏱️ Free user {uuid_} on premium channel | trial_used={trial_used} | trial_remaining={trial_remaining}s")
+        
         if trial_used and trial_remaining <= 0:
+            logger.warning(f"❌ PAYWALL: Trial exhausted for {uuid_}")
             return {
                 "success": False,
                 "action": "EXPIRED",
@@ -3219,6 +3197,8 @@ async def session_heartbeat(payload: dict):
             }}
         )
         
+        logger.info(f"⏱️ Trial countdown: {trial_remaining}s → {new_trial}s for {uuid_}")
+        
         return {
             "success": True if new_trial > 0 else False,
             "action": "EXPIRED" if new_trial <= 0 else "CONTINUE",
@@ -3227,6 +3207,7 @@ async def session_heartbeat(payload: dict):
         }
     else:
         # Watching free channel
+        logger.info(f"✅ Free user {uuid_} on free channel - CONTINUE")
         return {
             "success": True,
             "action": "CONTINUE",
@@ -3244,18 +3225,113 @@ async def playback_heartbeat_alias(payload: dict):
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                    ✅ SONICPESA INTEGRATION (PATCHED)                      ║
+# ║                     ✅ SONICPESA INTEGRATION                            ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+
+async def _load_package_doc(package_id: str):
+    config = await config_col.find_one({"name": "global"}) or {}
+    package_doc = next((p for p in config.get("packages", []) if str(p.get("id")) == str(package_id)), None)
+    return config, package_doc
+
+
+async def _apply_successful_payment_upgrade(payment: dict, package_doc: dict | None, *, now: Optional[datetime] = None,
+                                           reference: Optional[str] = None, transid: Optional[str] = None,
+                                           channel: Optional[str] = None, payload: Optional[dict] = None,
+                                           source: str = "sonicpesa") -> dict:
+    now = now or datetime.utcnow()
+    duration_td = _duration_td_from_package_or_payment(package_doc, payment)
+    duration_seconds = int(duration_td.total_seconds())
+    duration_days = max(1, int((duration_seconds + 86399) // 86400))
+    uuid_ = payment["uuid"]
+
+    device = await devices_col.find_one({"uuid": uuid_}) or {}
+    is_premium = device.get("isPremium") or device.get("is_premium") or False
+    premium_until_val = device.get("premiumUntil") or device.get("premium_until")
+
+    if is_premium and premium_until_val:
+        base_date = max(premium_until_val, now)
+        premium_until = base_date + duration_td
+    else:
+        premium_until = now + duration_td
+
+    await devices_col.update_one(
+        {"uuid": uuid_},
+        {"$set": {
+            "isPremium": True,
+            "is_premium": True,
+            "premiumUntil": premium_until,
+            "premium_until": premium_until,
+            "currentPackage": payment.get("package"),
+            "trialRemaining": 0,
+            "trialUsed": True,
+            "upgradedAt": now
+        }}
+    )
+
+    update_fields = {
+        "status": "COMPLETED",
+        "duration_seconds": duration_seconds,
+        "durationSeconds": duration_seconds,
+        "duration_days": duration_days,
+        "durationDays": duration_days,
+        "updatedAt": now,
+        "gateway": source,
+    }
+    if reference is not None:
+        update_fields["reference"] = reference
+    if transid is not None:
+        update_fields["transid"] = transid
+    if channel is not None:
+        update_fields["channel"] = channel
+    if payload is not None:
+        update_fields["webhook_payload"] = payload
+
+    await payments_col.update_one({"_id": payment["_id"]}, {"$set": update_fields})
+    logger.info(f"🚀 Device {uuid_} upgraded until {premium_until}")
+    return {"premiumUntil": premium_until, "durationSeconds": duration_seconds, "durationDays": duration_days}
+
+
+async def _fetch_sonicpesa_order_status(order_id: str) -> dict | None:
+    if not SONICPESA_API_KEY:
+        return None
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.post(
+            f"{SONICPESA_BASE_URL}/payment/order_status",
+            json={"order_id": order_id},
+            headers={
+                "Content-Type": "application/json",
+                "X-API-KEY": SONICPESA_API_KEY,
+            },
+        )
+
+    if resp.status_code == 404:
+        logger.info(f"ℹ️ SonicPesa: Order {order_id} not found yet (404). Keeping as PENDING.")
+        return {"payment_status": "PENDING", "raw": None}
+
+    if resp.status_code != 200:
+        logger.warning(f"⚠️ SonicPesa order_status returned {resp.status_code}: {resp.text}")
+        raise HTTPException(502, "Could not verify payment status")
+
+    sonic_data = resp.json()
+    data = sonic_data.get("data") or {}
+    transaction = sonic_data.get("transaction") or {}
+    raw_status = data.get("payment_status") or transaction.get("status") or sonic_data.get("status")
+    return {
+        "payment_status": normalize_gateway_payment_status(raw_status),
+        "raw": sonic_data,
+        "reference": data.get("reference"),
+        "transid": data.get("transid"),
+        "channel": data.get("channel"),
+        "msisdn": data.get("msisdn") or data.get("phone"),
+    }
+
 
 @app.post("/payment/start")
 async def start_payment(payload: dict):
     """
     🚀 INITIATE SONICPESA PAYMENT
-
-    Keeps the existing app flow unchanged:
-      1. create local pending record
-      2. trigger SonicPesa Push USSD
-      3. return order_id for polling
+    Frontend-compatible endpoint retained as /payment/start.
     """
     phone = payload.get("phone") or payload.get("phone_number") or ""
     normalized_phone = normalize_phone(phone) if phone else ""
@@ -3266,19 +3342,13 @@ async def start_payment(payload: dict):
 
     if not package_id or not uuid_:
         raise HTTPException(400, "package and uuid are required")
-
+    if not normalized_phone:
+        raise HTTPException(400, "A valid Tanzanian phone number is required")
     if not SONICPESA_API_KEY:
         logger.error("❌ SONICPESA_API_KEY not configured!")
         raise HTTPException(500, "Payment system not configured")
 
-    config = await config_col.find_one({"name": "global"})
-    if not config:
-        raise HTTPException(500, "Server config missing")
-
-    package_doc = next(
-        (p for p in config.get("packages", []) if p.get("id") == package_id),
-        None
-    )
+    _, package_doc = await _load_package_doc(package_id)
     if not package_doc:
         raise HTTPException(404, "Invalid package")
 
@@ -3287,51 +3357,46 @@ async def start_payment(payload: dict):
     duration_seconds = int(duration_td.total_seconds())
     if duration_seconds <= 0:
         raise HTTPException(500, "Package duration misconfigured")
-
     duration_days = max(1, int((duration_seconds + 86399) // 86400))
-    internal_payment_id = str(uuid.uuid4())
 
-    logger.info(f"💳 Starting SonicPesa payment: internal_payment_id={internal_payment_id}, phone={normalized_phone}, amount={amount}")
+    local_order_id = str(uuid.uuid4())
+    logger.info(f"💳 Starting SonicPesa payment: local_order_id={local_order_id}, phone={normalized_phone}, amount={amount}")
 
-    try:
-        await payments_col.insert_one({
-            "internal_payment_id": internal_payment_id,
-            "order_id": None,
-            "orderId": None,
-            "uuid": uuid_,
-            "package": package_id,
-            "package_name": package_doc.get("name"),
-            "duration_days": duration_days,
-            "duration_seconds": duration_seconds,
-            "durationSeconds": duration_seconds,
-            "duration_unit": (package_doc.get("durationUnit") or package_doc.get("duration_unit")),
-            "duration_value": (package_doc.get("durationValue") or package_doc.get("duration_value")),
-            "phone": phone,
-            "buyer_phone": normalized_phone,
-            "buyer_name": name,
-            "buyer_email": email,
-            "amount": amount,
-            "currency": "TZS",
-            "status": "PENDING",
-            "gateway": "SONICPESA",
-            "createdAt": datetime.utcnow(),
-            "sonic_response": None,
-            "webhook_payload": None
-        })
-    except Exception as e:
-        logger.error(f"❌ Database error: {e}")
-        raise HTTPException(500, "Failed to create payment record")
+    await payments_col.insert_one({
+        "order_id": local_order_id,
+        "orderId": local_order_id,
+        "gatewayOrderId": None,
+        "uuid": uuid_,
+        "package": package_id,
+        "package_name": package_doc.get("name"),
+        "duration_days": duration_days,
+        "duration_seconds": duration_seconds,
+        "durationSeconds": duration_seconds,
+        "duration_unit": (package_doc.get("durationUnit") or package_doc.get("duration_unit")),
+        "duration_value": (package_doc.get("durationValue") or package_doc.get("duration_value")),
+        "phone": normalized_phone,
+        "amount": amount,
+        "currency": "TZS",
+        "status": "PENDING",
+        "gateway": "sonicpesa",
+        "createdAt": datetime.utcnow(),
+        "gateway_response": None,
+        "webhook_payload": None
+    })
 
     sonic_payload = {
-        "buyer_email": email,
         "buyer_name": name,
         "buyer_phone": normalized_phone,
+        "buyer_email": email,
         "amount": amount,
-        "currency": "TZS"
+        "currency": "TZS",
     }
+    if SONICPESA_WEBHOOK_URL:
+        sonic_payload["webhook_url"] = SONICPESA_WEBHOOK_URL
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
+            logger.info(f"📤 Calling SonicPesa API: {sonic_payload}")
             resp = await client.post(
                 f"{SONICPESA_BASE_URL}/payment/create_order",
                 json=sonic_payload,
@@ -3340,298 +3405,236 @@ async def start_payment(payload: dict):
                     "X-API-KEY": SONICPESA_API_KEY,
                 },
             )
+            logger.info(f"📥 SonicPesa response: status={resp.status_code}, body={resp.text}")
     except httpx.TimeoutException:
-        logger.error("❌ SonicPesa API timeout")
-        await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {"status": "FAILED", "error": "Gateway timeout"}}
-        )
+        await payments_col.update_one({"order_id": local_order_id}, {"$set": {"status": "FAILED", "error": "Gateway timeout"}})
         raise HTTPException(504, "Payment gateway timeout. Please try again.")
     except Exception as e:
-        logger.error(f"❌ SonicPesa API error: {e}")
-        await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {"status": "FAILED", "error": str(e)}}
-        )
+        await payments_col.update_one({"order_id": local_order_id}, {"$set": {"status": "FAILED", "error": str(e)}})
         raise HTTPException(502, "Payment gateway error")
 
     if resp.status_code not in (200, 201, 202):
         error_msg = resp.text
-        logger.error(f"❌ SonicPesa rejected request: {error_msg}")
         await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {
-                "status": "FAILED",
-                "sonic_response": error_msg,
-                "error": f"Gateway rejected with status {resp.status_code}"
-            }}
+            {"order_id": local_order_id},
+            {"$set": {"status": "FAILED", "gateway_response": error_msg, "error": f"Gateway rejected with status {resp.status_code}"}}
         )
         raise HTTPException(502, f"Payment gateway rejected request: {error_msg}")
 
     try:
         sonic_data = resp.json()
         data = sonic_data.get("data") or {}
-        sonic_order_id = data.get("order_id")
-        reference = data.get("reference")
-        gateway_status = extract_sonicpesa_gateway_status(sonic_data) or "PENDING"
-        mapped_status = map_sonicpesa_status(gateway_status)
-
-        if not sonic_order_id:
-            await payments_col.update_one(
-                {"internal_payment_id": internal_payment_id},
-                {"$set": {
-                    "status": "FAILED",
-                    "sonic_response": sonic_data,
-                    "error": "Missing order_id in SonicPesa response"
-                }}
-            )
-            raise HTTPException(502, "Invalid response from payment gateway")
+        gateway_order_id = data.get("order_id") or local_order_id
+        raw_status = data.get("payment_status") or data.get("status") or sonic_data.get("status")
+        normalized_status = normalize_gateway_payment_status(raw_status)
 
         await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
+            {"order_id": local_order_id},
             {"$set": {
-                "order_id": sonic_order_id,
-                "orderId": sonic_order_id,
-                "reference": reference,
-                "gateway_status": gateway_status,
-                "status": mapped_status if mapped_status != "COMPLETED" else "PENDING",
-                "sonic_response": sonic_data,
-                "updatedAt": datetime.utcnow(),
+                "order_id": gateway_order_id,
+                "orderId": gateway_order_id,
+                "gatewayOrderId": gateway_order_id,
+                "reference": data.get("reference"),
+                "gateway_response": sonic_data,
+                "status": normalized_status if normalized_status in ("PENDING", "PROCESSING") else "PENDING",
             }}
         )
 
-        logger.info(f"✅ SonicPesa payment initiated successfully: order_id={sonic_order_id}")
         return {
-            "order_id": sonic_order_id,
-            "reference": reference,
-            "status": "PENDING",
-            "message": sonic_data.get("message", "USSD request sent. Please confirm on your phone.")
+            "order_id": gateway_order_id,
+            "status": "PENDING" if normalized_status == "PROCESSING" else normalized_status,
+            "message": sonic_data.get("message", "USSD request sent. Please confirm on your phone."),
+            "sonic_status": data.get("payment_status") or data.get("status") or sonic_data.get("status"),
+            "sonic_reference": data.get("reference"),
         }
-    except HTTPException:
-        raise
     except Exception as e:
         logger.error(f"❌ Failed to parse SonicPesa response: {e}")
         raise HTTPException(502, "Invalid response from payment gateway")
+
 
 @app.get("/payment/status/{order_id}")
 async def payment_status(order_id: str):
     """
     📊 CHECK PAYMENT STATUS
-    Keeps the existing frontend contract intact while polling SonicPesa as fallback.
+    Frontend-compatible endpoint retained as /payment/status/{order_id}.
+    Returns SUCCESS when the user has been upgraded.
     """
-    latest_payment = await find_payment_by_order_id(order_id)
-    if not latest_payment:
+    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}, {"gatewayOrderId": order_id}]}).sort("createdAt", -1)
+    payments = await cursor.to_list(length=1)
+    if not payments:
         raise HTTPException(404, "Payment not found")
 
-    current_status = latest_payment.get("status", "PENDING")
+    latest_payment = payments[0]
+    current_status = normalize_gateway_payment_status(latest_payment.get("status", "PENDING"))
 
-    if current_status == "PENDING" and SONICPESA_API_KEY:
+    if current_status in ("PENDING", "PROCESSING"):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{SONICPESA_BASE_URL}/payment/order_status",
-                    json={"order_id": order_id},
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-API-KEY": SONICPESA_API_KEY,
-                    },
-                )
-
-            if resp.status_code == 200:
-                sonic_data = resp.json()
-                gateway_status = extract_sonicpesa_gateway_status(sonic_data)
-                mapped_status = map_sonicpesa_status(gateway_status)
-                data = sonic_data.get("data") if isinstance(sonic_data.get("data"), dict) else {}
-
-                update_data = {
-                    "gateway_status": gateway_status or latest_payment.get("gateway_status"),
-                    "sonic_status_response": sonic_data,
-                    "updatedAt": datetime.utcnow(),
-                }
-                if data.get("reference"):
-                    update_data["reference"] = data.get("reference")
-                if data.get("transid"):
-                    update_data["transid"] = data.get("transid")
-                if data.get("channel"):
-                    update_data["channel"] = data.get("channel")
-
-                if mapped_status == "COMPLETED":
-                    latest_payment = await complete_payment_and_upgrade_user(
+            sonic_status_data = await _fetch_sonicpesa_order_status(order_id)
+            if sonic_status_data:
+                current_status = sonic_status_data["payment_status"]
+                if current_status == "COMPLETED":
+                    _, package_doc = await _load_package_doc(latest_payment.get("package"))
+                    await _apply_successful_payment_upgrade(
                         latest_payment,
-                        gateway_payload=sonic_data,
-                        source="status_poll"
+                        package_doc,
+                        reference=sonic_status_data.get("reference"),
+                        transid=sonic_status_data.get("transid"),
+                        channel=sonic_status_data.get("channel"),
+                        payload=sonic_status_data.get("raw"),
                     )
-                    current_status = "COMPLETED"
-                else:
-                    if mapped_status == "FAILED":
-                        update_data["status"] = "FAILED"
-                        current_status = "FAILED"
-                    else:
-                        current_status = latest_payment.get("status", "PENDING")
-                    await payments_col.update_one({"_id": latest_payment["_id"]}, {"$set": update_data})
-            else:
-                logger.warning(f"⚠️ SonicPesa order_status returned {resp.status_code}: {resp.text}")
+                elif current_status in ("FAILED", "CANCELLED"):
+                    await payments_col.update_one(
+                        {"_id": latest_payment["_id"]},
+                        {"$set": {"status": current_status, "updatedAt": datetime.utcnow(), "gateway_response": sonic_status_data.get("raw")}}
+                    )
+        except HTTPException:
+            raise
         except Exception as e:
-            logger.error(f"⚠️ SonicPesa status polling failed: {e}")
+            logger.error(f"⚠️ SonicPesa auto-check failed: {e}")
 
     final_status_for_app = "SUCCESS" if current_status == "COMPLETED" else current_status
-    device = await devices_col.find_one({"uuid": latest_payment["uuid"]})
+    refreshed_payment = await payments_col.find_one({"_id": latest_payment["_id"]}) or latest_payment
+    device = await devices_col.find_one({"uuid": refreshed_payment["uuid"]})
 
     return {
         "order_id": order_id,
         "status": final_status_for_app,
-        "amount": latest_payment.get("amount"),
-        "package": latest_payment.get("package_name"),
-        "isPremium": device.get("isPremium", False) if device else False,
-        "premiumUntil": device.get("premiumUntil").isoformat() if device and device.get("premiumUntil") else None,
-        "createdAt": latest_payment.get("createdAt").isoformat() if latest_payment.get("createdAt") else None
+        "amount": refreshed_payment.get("amount"),
+        "package": refreshed_payment.get("package_name"),
+        "isPremium": (device.get("isPremium") or device.get("is_premium") or False) if device else False,
+        "premiumUntil": (device.get("premiumUntil") or device.get("premium_until")).isoformat() if device and (device.get("premiumUntil") or device.get("premium_until")) else None,
+        "createdAt": refreshed_payment.get("createdAt").isoformat() if refreshed_payment.get("createdAt") else None
     }
+
 
 @app.post("/payment/manual-upgrade/{order_id}")
 async def manual_upgrade_trigger(order_id: str):
-    """
-    🔧 MANUAL UPGRADE TRIGGER (Fallback if webhook fails)
-
-    Keeps the existing endpoint, but verifies payment with SonicPesa.
-    """
+    """Fallback trigger that checks SonicPesa and upgrades if payment is successful."""
     logger.info(f"🔧 Manual SonicPesa upgrade triggered for order_id: {order_id}")
-
-    payment = await find_payment_by_order_id(order_id)
-    if not payment:
+    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}, {"gatewayOrderId": order_id}]}).sort("createdAt", -1)
+    payments = await cursor.to_list(length=1)
+    if not payments:
         raise HTTPException(404, "Payment not found")
 
-    if payment.get("status") == "COMPLETED":
+    payment = payments[0]
+    _, package_doc = await _load_package_doc(payment.get("package"))
+
+    if normalize_gateway_payment_status(payment.get("status")) == "COMPLETED":
         device = await devices_col.find_one({"uuid": payment["uuid"]})
         return {
             "status": "already_upgraded",
-            "isPremium": device.get("isPremium", False) if device else False,
+            "isPremium": (device.get("isPremium") or device.get("is_premium") or False) if device else False,
             "message": "User already upgraded"
         }
 
     if not SONICPESA_API_KEY:
         raise HTTPException(500, "Payment system not configured")
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{SONICPESA_BASE_URL}/payment/order_status",
-                json={"order_id": order_id},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-KEY": SONICPESA_API_KEY,
-                },
-            )
+    sonic_status_data = await _fetch_sonicpesa_order_status(order_id)
+    payment_status = sonic_status_data["payment_status"] if sonic_status_data else "PENDING"
+    logger.info(f"📊 SonicPesa status: {payment_status}")
 
-        if resp.status_code != 200:
-            logger.error(f"❌ SonicPesa status check failed: {resp.status_code} - {resp.text}")
-            raise HTTPException(502, "Could not verify payment status")
-
-        sonic_data = resp.json()
-        gateway_status = extract_sonicpesa_gateway_status(sonic_data)
-        mapped_status = map_sonicpesa_status(gateway_status)
-
-        if mapped_status != "COMPLETED":
-            if mapped_status == "FAILED":
-                await payments_col.update_one(
-                    {"_id": payment["_id"]},
-                    {"$set": {
-                        "status": "FAILED",
-                        "gateway_status": gateway_status,
-                        "updatedAt": datetime.utcnow(),
-                        "sonic_status_response": sonic_data,
-                    }}
-                )
-            return {
-                "status": "not_completed",
-                "payment_status": gateway_status or "PENDING",
-                "message": "Payment not yet completed"
-            }
-
-        payment = await complete_payment_and_upgrade_user(
-            payment,
-            gateway_payload=sonic_data,
-            source="manual_upgrade"
-        )
-
-        logger.info(f"✅ Manual upgrade successful for {payment['uuid']}")
+    if payment_status != "COMPLETED":
+        if payment_status in ("FAILED", "CANCELLED"):
+            await payments_col.update_one({"_id": payment["_id"]}, {"$set": {"status": payment_status, "updatedAt": datetime.utcnow()}})
         return {
-            "status": "upgraded",
-            "isPremium": True,
-            "premiumUntil": payment.get("premiumUntil").isoformat() if payment.get("premiumUntil") else None,
-            "message": "Upgrade successful"
+            "status": "not_completed",
+            "payment_status": payment_status,
+            "message": "Payment not yet completed"
         }
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Payment verification timeout")
-    except Exception as e:
-        logger.error(f"❌ Manual SonicPesa upgrade error: {e}")
-        raise HTTPException(500, "Upgrade failed")
 
-# ==========================================
-# SonicPesa webhook aliases
-# ==========================================
+    result = await _apply_successful_payment_upgrade(
+        payment,
+        package_doc,
+        reference=sonic_status_data.get("reference"),
+        transid=sonic_status_data.get("transid"),
+        channel=sonic_status_data.get("channel"),
+        payload=sonic_status_data.get("raw"),
+    )
+
+    await payments_col.update_one({"_id": payment["_id"]}, {"$set": {"manual_upgrade": True}})
+    return {
+        "status": "upgraded",
+        "isPremium": True,
+        "premiumUntil": result["premiumUntil"].isoformat(),
+        "message": "Upgrade successful"
+    }
+
+
 @app.post("/webhooks/sonic")
-@app.post("/webhooks/zeno")      # Backward compatibility alias
-@app.post("/payment-webhook")    # Keep this for backward compatibility
+@app.post("/payment-webhook")
+@app.post("/webhooks/zeno")
 async def sonicpesa_webhook(request: Request):
-    """🔔 SONICPESA WEBHOOK HANDLER"""
+    """🔔 SONICPESA WEBHOOK HANDLER. Legacy routes retained for easier deployment."""
     logger.info("=" * 80)
     logger.info("🔔 SONICPESA WEBHOOK RECEIVED - Starting processing")
     logger.info("=" * 80)
 
     raw_body = await request.body()
-    signature = request.headers.get("X-SonicPesa-Signature")
+    signature = request.headers.get("X-SonicPesa-Signature") or request.headers.get("x-sonicpesa-signature")
+    if not verify_sonicpesa_signature(raw_body, signature):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:
-        payload = json.loads(raw_body.decode("utf-8"))
+        if "application/json" in request.headers.get("content-type", ""):
+            payload = json.loads(raw_body.decode("utf-8") or "{}")
+        else:
+            form_data = await request.form()
+            payload = dict(form_data)
         logger.info(f"📦 SonicPesa Webhook Payload: {payload}")
     except Exception as e:
-        logger.error(f"❌ Could not parse SonicPesa webhook body: {e}")
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid JSON payload"})
-
-    if not verify_sonicpesa_signature(raw_body, signature or ""):
-        return JSONResponse(status_code=401, content={"status": "error", "message": "Invalid signature"})
+        logger.error(f"❌ Could not parse webhook body: {e}")
+        return {"status": "error", "message": "Parse error"}
 
     order_id = payload.get("order_id")
-    event_name = (payload.get("event") or "").strip().lower()
-    gateway_status = extract_sonicpesa_gateway_status(payload)
-    mapped_status = map_sonicpesa_status(gateway_status)
+    payment_status = normalize_gateway_payment_status(payload.get("status") or payload.get("payment_status"))
+    reference = payload.get("reference")
+    transid = payload.get("transid")
+    channel = payload.get("channel")
+    event = (payload.get("event") or "").strip().lower()
 
-    if not order_id:
-        logger.warning("⚠️ SonicPesa webhook missing order_id")
-        return {"status": "ignored", "reason": "missing order_id"}
+    if not order_id or not payment_status:
+        logger.warning("⚠️ Incomplete SonicPesa webhook payload")
+        return {"status": "ignored", "reason": "missing fields"}
 
-    payment = await find_payment_by_order_id(order_id)
-    if not payment:
-        logger.warning(f"⚠️ Payment not found for SonicPesa order_id: {order_id}")
+    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}, {"gatewayOrderId": order_id}]}).sort("createdAt", -1)
+    payments = await cursor.to_list(length=1)
+    if not payments:
+        logger.warning(f"⚠️ Payment not found for order_id: {order_id}")
         return {"status": "ignored", "reason": "order_id not found in DB"}
 
-    if payment.get("status") == "COMPLETED":
+    payment = payments[0]
+    _, package_doc = await _load_package_doc(payment.get("package"))
+
+    if normalize_gateway_payment_status(payment.get("status")) == "COMPLETED":
         logger.info(f"✅ Payment {order_id} already processed")
         return {"status": "already processed"}
 
-    if mapped_status == "COMPLETED" and event_name == "payment.completed":
-        logger.info(f"✅ SonicPesa payment completed: {order_id}")
-        await complete_payment_and_upgrade_user(payment, gateway_payload=payload, source="webhook")
+    if payment_status == "COMPLETED" or event == "payment.completed":
+        await _apply_successful_payment_upgrade(
+            payment,
+            package_doc,
+            reference=reference,
+            transid=transid,
+            channel=channel,
+            payload=payload,
+        )
         return {"status": "ok"}
 
-    update_data = {
-        "webhook_payload": payload,
-        "gateway_status": gateway_status or payment.get("gateway_status"),
-        "updatedAt": datetime.utcnow(),
-    }
-    if payload.get("reference"):
-        update_data["reference"] = payload.get("reference")
-    if payload.get("transid"):
-        update_data["transid"] = payload.get("transid")
-    if payload.get("channel"):
-        update_data["channel"] = payload.get("channel")
-    if mapped_status == "FAILED":
-        update_data["status"] = "FAILED"
+    if payment_status in ("FAILED", "CANCELLED"):
+        await payments_col.update_one(
+            {"_id": payment["_id"]},
+            {"$set": {"status": payment_status, "updatedAt": datetime.utcnow(), "reference": reference, "transid": transid, "channel": channel, "webhook_payload": payload}}
+        )
+        return {"status": "ok", "payment_status": payment_status}
 
-    await payments_col.update_one({"_id": payment["_id"]}, {"$set": update_data})
-    return {"status": "ok"}
+    await payments_col.update_one(
+        {"_id": payment["_id"]},
+        {"$set": {"status": payment_status, "updatedAt": datetime.utcnow(), "reference": reference, "transid": transid, "channel": channel, "webhook_payload": payload}}
+    )
+    return {"status": "ok", "payment_status": payment_status}
+
+
 
 @app.get("/payment/check-upgrade/{uuid}")
 async def check_upgrade_status(uuid: str):
