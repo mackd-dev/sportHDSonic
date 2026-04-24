@@ -14,6 +14,7 @@ import httpx
 import base64
 import binascii
 import ipaddress
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from urllib.parse import urljoin, quote, unquote, urlparse
@@ -1642,9 +1643,6 @@ _SIG_EXEMPT_PREFIXES = (
     "/manifest",
     "/drm",
 )
-
-import time
-from collections import defaultdict
 
 # Simple in-memory rate limiter
 _RATE_LIMIT_WINDOW = 60  # seconds
