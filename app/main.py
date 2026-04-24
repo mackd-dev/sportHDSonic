@@ -499,7 +499,7 @@ class StreamSession(BaseModel):
 async def maybe_auto_expire_premium(device: dict) -> dict:
     """
     Checks if a device's premium subscription has expired and downgrades it if so.
-    Ensures trialRemaining is reset upon downgrade.
+    Ensures trialRemaining is reset upon downgrade using the current admin config.
     """
     if not device:
         return device
@@ -510,14 +510,15 @@ async def maybe_auto_expire_premium(device: dict) -> dict:
 
     if is_premium and premium_until and premium_until <= now:
         logger.info(f"🚫 Premium expired for {device.get('uuid')} - Auto-downgrading")
-        
-        TRIAL_AFTER_DOWNGRADE = 5
+
+        flags = await get_admin_flags()
+        trial_after_downgrade = int(flags.get("trialSeconds", 300) or 300)
 
         update = {
             "isPremium": False,
             "premiumUntil": None,
             "currentPackage": None,
-            "trialRemaining": TRIAL_AFTER_DOWNGRADE,
+            "trialRemaining": trial_after_downgrade,
             "trialUsed": False,
             "trialPausedAt": None,
             "lastChannelId": None,
@@ -531,7 +532,7 @@ async def maybe_auto_expire_premium(device: dict) -> dict:
 
         # Update the local device object to reflect changes
         device.update(update)
-    
+
     return device
 
 def _parse_duration_seconds_from_doc(doc: dict) -> int:
@@ -1489,6 +1490,24 @@ from collections import defaultdict
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX_REQUESTS = 100
 _rate_limit_store = defaultdict(list)
+_nonce_store: dict[str, float] = {}
+
+def _prune_nonce_store(max_age: int = 300) -> None:
+    now = time.time()
+    expired = [key for key, seen_at in _nonce_store.items() if now - seen_at > max_age]
+    for key in expired:
+        _nonce_store.pop(key, None)
+
+def _remember_request_nonce(device_id: str, nonce: str, max_age: int = 300) -> bool:
+    if not device_id or not nonce:
+        return False
+    _prune_nonce_store(max_age)
+    cache_key = f"{device_id}:{nonce}"
+    if cache_key in _nonce_store:
+        return False
+    _nonce_store[cache_key] = time.time()
+    return True
+
 
 def is_rate_limited(identifier: str) -> bool:
     now = time.time()
@@ -1557,6 +1576,14 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
         # /device/register only needs X-DEVICE-ID (no Bearer yet at registration)
         is_bootstrap = path in {"/device/register"}
 
+        package_name = request.headers.get("x-package-name", "")
+        if APP_PACKAGE_NAME and not hmac.compare_digest(package_name, APP_PACKAGE_NAME):
+            logger.warning(
+                f"🚫 Blocked — bad package header | path={path} ip={client_ip} "
+                f"pkg={package_name!r}"
+            )
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
         # 1. X-Client-Sig — enforce if APP_CLIENT_SECRET is configured
         if APP_CLIENT_SECRET:
             sig       = request.headers.get("x-client-sig", "")
@@ -1588,6 +1615,12 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
                 logger.warning(
                     f"🚫 Blocked — bad X-Client-Sig | path={path} ip={client_ip} "
                     f"ua={request.headers.get('user-agent', '')[:60]}"
+                )
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+            if not _remember_request_nonce(device_id, nonce, self._SIG_MAX_AGE):
+                logger.warning(
+                    f"🚫 Blocked — replayed X-Client-Nonce | path={path} ip={client_ip} device={device_id}"
                 )
                 return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
@@ -2248,35 +2281,15 @@ async def get_entitlement(request: Request, x_device_id: str = Header(None)):
     client_ip = get_client_ip(request) or "unknown"
 
     if not device:
-        guard = await apply_ip_guard(x_device_id, request, {}, None)
-        device = {
-            "uuid": x_device_id,
-            "isPremium": False,
-            "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
-            "trialStartedAt": now,
-            "trialUsed": False,
-            "trialPausedAt": None,
-            "lastChannelId": None,
-            "createdAt": now,
-            "lastSeen": now,
-            "lastIp": client_ip,
-        }
-        if guard.get("block_device"):
-            device.update({
-                "isBlocked": True,
-                "blockReason": guard.get("reason"),
-                "blockedAt": now,
-                "ipGuardFlagged": True,
-            })
-        await devices_col.insert_one(device)
-    else:
-        await devices_col.update_one(
-            {"uuid": x_device_id},
-            {"$set": {"lastSeen": now, "lastIp": client_ip}},
-        )
-        device["lastSeen"] = now
-        device["lastIp"] = client_ip
-        device = await maybe_auto_expire_premium(device)
+        raise HTTPException(404, "Device not found. Register the device first.")
+
+    await devices_col.update_one(
+        {"uuid": x_device_id},
+        {"$set": {"lastSeen": now, "lastIp": client_ip}},
+    )
+    device["lastSeen"] = now
+    device["lastIp"] = client_ip
+    device = await maybe_auto_expire_premium(device)
 
     _assert_device_not_blocked(device, "Device blocked by IP Guard")
 
@@ -2436,6 +2449,11 @@ async def start_session(payload: dict, request: Request):
             {"$set": {"lastChannelId": channel_id}}
         )
 
+    existing_active_session = await sessions_col.find_one(
+        {"uuid": uuid_, "active": True},
+        sort=[("createdAt", -1)],
+    )
+
     # Kill old sessions
     await sessions_col.update_many(
         {"uuid": uuid_, "active": True},
@@ -2592,10 +2610,34 @@ async def start_session(payload: dict, request: Request):
             mpd_url = f"{base_url}/api/mpd/clearkey-proxy/{token}"
             # logger.info(f"🔁 Using Android ClearKey MPD proxy: {mpd_url}")
 
-    # Compute server-side trial deadline so heartbeat never trusts app clock
+    # Compute server-side trial deadline so heartbeat never trusts app clock.
+    # If the app restarts or a cloner replays /session/start, preserve any still-active
+    # deadline from the previous session instead of stamping a fresh one.
     _trial_deadline = None
     if channel.is_premium and not user_is_premium and trial_remaining > 0:
-        _trial_deadline = datetime.utcnow() + timedelta(seconds=int(trial_remaining))
+        now_session = datetime.utcnow()
+        preserved_deadline = (existing_active_session or {}).get("trialDeadlineAt")
+
+        if preserved_deadline and isinstance(preserved_deadline, datetime):
+            if preserved_deadline <= now_session:
+                await devices_col.update_one(
+                    {"uuid": uuid_},
+                    {"$set": {"trialRemaining": 0, "trialUsed": True, "trialPausedAt": now_session}}
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="Trial exhausted for premium channels. Please upgrade to Premium to continue watching."
+                )
+
+            _trial_deadline = preserved_deadline
+            trial_remaining = max(0, int((preserved_deadline - now_session).total_seconds()))
+        else:
+            _trial_deadline = now_session + timedelta(seconds=int(trial_remaining))
+
+        await devices_col.update_one(
+            {"uuid": uuid_},
+            {"$set": {"trialRemaining": trial_remaining, "trialPausedAt": now_session}}
+        )
 
     await sessions_col.insert_one({
         "uuid": uuid_,
@@ -4143,8 +4185,9 @@ async def session_heartbeat(payload: dict):
             if premium_until <= now:
                 logger.warning(f"🚫 Premium subscription EXPIRED for {uuid_} | expired_at={premium_until}")
                 
-                TRIAL_AFTER_DOWNGRADE = 5
-                
+                flags = await get_admin_flags()
+                trial_after_downgrade = int(flags.get("trialSeconds", 300) or 300)
+
                 # ✅ Downgrade immediately + restore trial seconds to DB
                 await devices_col.update_one(
                     {"uuid": uuid_},
@@ -4152,22 +4195,22 @@ async def session_heartbeat(payload: dict):
                         "isPremium": False,
                         "premiumUntil": None,
                         "currentPackage": None,
-                        "trialRemaining": TRIAL_AFTER_DOWNGRADE,
+                        "trialRemaining": trial_after_downgrade,
                         "trialUsed": False,
                         "trialPausedAt": None,
                         "lastChannelId": None,
                         "downgradedAt": now
                     }}
                 )
-                
-                logger.info(f"✅ Downgraded user {uuid_} and restored 5s trial")
-                
+
+                logger.info(f"✅ Downgraded user {uuid_} and restored {trial_after_downgrade}s trial")
+
                 # Return trial seconds so app can continue
                 return {
                     "success": True,
                     "action": "CONTINUE",
                     "isPremium": False,
-                    "trialRemaining": TRIAL_AFTER_DOWNGRADE,
+                    "trialRemaining": trial_after_downgrade,
                     "message": "Subscription expired. Trial started."
                 }
             else:
@@ -4251,9 +4294,13 @@ async def session_heartbeat(payload: dict):
         if trial_deadline and isinstance(trial_deadline, datetime):
             new_trial = max(0, int((trial_deadline - now_hb).total_seconds()))
         else:
-            # Fallback for legacy sessions without a deadline:
-            # tick down by a fixed 30s server-side — app cannot influence this.
-            new_trial = max(0, trial_remaining - 30)
+            # Fallback for legacy sessions without a deadline: consume real wall-clock
+            # elapsed time since the last server-side touch instead of a flat decrement.
+            reference_time = device.get("trialPausedAt") or session.get("createdAt") or now_hb
+            if not isinstance(reference_time, datetime):
+                reference_time = now_hb
+            elapsed_seconds = max(0, int((now_hb - reference_time).total_seconds()))
+            new_trial = max(0, trial_remaining - elapsed_seconds)
 
         await devices_col.update_one(
             {"uuid": uuid_},
@@ -4898,9 +4945,9 @@ async def expire_subscriptions(admin: dict = Depends(get_current_admin)):
     """
     now = datetime.utcnow()
     
-    # ✅ pull trialSeconds from config (defaults to 5)
+    # ✅ pull trialSeconds from config (defaults to current admin trial value)
     flags = await get_admin_flags()
-    trial_seconds = int(flags.get("trialSeconds", 5) or 5)
+    trial_seconds = int(flags.get("trialSeconds", 300) or 300)
 
     result = await devices_col.update_many(
         {"isPremium": True, "premiumUntil": {"$lte": now}},
@@ -4909,6 +4956,7 @@ async def expire_subscriptions(admin: dict = Depends(get_current_admin)):
             "premiumUntil": None,
             "currentPackage": None,
             "trialRemaining": trial_seconds,
+            "trialUsed": False,
             "trialPausedAt": None,
             "lastChannelId": None,
             "downgradedAt": now
