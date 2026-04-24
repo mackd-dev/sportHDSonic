@@ -1,6 +1,7 @@
 """
-Channel Scraper Module
+Channel Scraper Module - UPDATED FOR NEW API FORMAT
 Fetches stream URLs from nur.mpingotv.com and stores them in MongoDB
+Updated: March 2026 - API now returns HTML with embedded JavaScript variables
 """
 
 import asyncio
@@ -45,6 +46,11 @@ class ChannelScraper:
     async def scrape_channels(self, max_channels: int = 100) -> Dict[str, Any]:
         """
         Scrape all available channels from nur.mpingotv.com.
+        
+        NEW FORMAT (March 2026): API returns HTML with embedded JavaScript variables
+        - var streamUrl = "..."
+        - var streamType = "..."
+        - var clearKey = "..."
 
         Args:
             max_channels: Maximum number of channels to scan (default 100)
@@ -82,32 +88,49 @@ class ChannelScraper:
 
                         html = response.text
 
-                        # Extract stream name from H1 tag
-                        name_match = re.search(
-                            r'<h1 id="streamName"[^>]*>(.*?)</h1>',
-                            html
-                        )
-
-                        # Extract stream URL from script
+                        # NEW FORMAT: Extract stream URL from JavaScript variable
                         url_match = re.search(
-                            r'var streamUrl = "(.*?)";',
+                            r'var streamUrl = "([^"]+)"',
                             html
                         )
 
-                        if name_match and url_match:
-                            name = name_match.group(1).strip()
-                            stream_url = url_match.group(1).strip()
+                        # NEW FORMAT: Extract stream type (mpd or hls)
+                        type_match = re.search(
+                            r'var streamType = "([^"]+)"',
+                            html
+                        )
 
+                        # NEW FORMAT: Extract clearkey if available
+                        clearkey_match = re.search(
+                            r'var clearKey = "([^"]+)"',
+                            html
+                        )
+
+                        # Extract channel name from page title
+                        title_match = re.search(
+                            r'<title>([^<]+)</title>',
+                            html
+                        )
+
+                        if url_match:
+                            stream_url = url_match.group(1).strip()
+                            stream_type = type_match.group(1).strip() if type_match else "mpd"
+                            clearkey = clearkey_match.group(1).strip() if clearkey_match else None
+                            channel_name = title_match.group(1).strip() if title_match else f"Channel {channel_id}"
+
+                            # Validate stream URL
                             if stream_url and ("mpd" in stream_url.lower() or "m3u8" in stream_url.lower()):
-                                logger.info(f"✅ Found Channel {channel_id}: {name}")
+                                logger.info(f"✅ Found Channel {channel_id}: {channel_name} ({stream_type})")
 
                                 # Calculate expiration time
                                 url_expires_at = datetime.utcnow() + timedelta(hours=self.TOKEN_EXPIRY_HOURS)
 
                                 channel_data = {
                                     "channelId": channel_id,
-                                    "name": name,
+                                    "name": channel_name,
                                     "streamUrl": stream_url,
+                                    "streamType": stream_type,
+                                    "clearKey": clearkey,
                                     "urlExpiresAt": url_expires_at,
                                     "lastScrapedAt": datetime.utcnow(),
                                     "status": "active",
@@ -129,7 +152,7 @@ class ChannelScraper:
                                 logger.debug(f"⚠️ Channel {channel_id}: No valid stream URL")
                                 channels_failed += 1
                         else:
-                            logger.debug(f"⚠️ Channel {channel_id}: Could not extract name or URL")
+                            logger.debug(f"⚠️ Channel {channel_id}: Could not extract stream URL")
                             channels_failed += 1
 
                     except asyncio.TimeoutError:
@@ -148,196 +171,79 @@ class ChannelScraper:
             error_msg = f"Scraper error: {str(e)}"
             errors.append(error_msg)
 
-            # Log the failure
-            await self._log_scraper_run(
-                run_started_at,
-                0,
-                0,
-                0,
-                "failed",
-                error_msg
-            )
+        # Log the scrape run
+        run_ended_at = datetime.utcnow()
+        duration_seconds = (run_ended_at - run_started_at).total_seconds()
 
-            return {
-                "success": False,
-                "channels_found": 0,
-                "channels_updated": 0,
-                "channels_failed": 0,
-                "error": error_msg,
-                "channels": []
-            }
-
-        # Determine overall status
-        status = "success" if channels_failed == 0 else ("partial" if channels_found > 0 else "failed")
-
-        # Log the scraper run
-        await self._log_scraper_run(
-            run_started_at,
-            len(channels_found),
-            channels_updated,
-            channels_failed,
-            status,
-            "; ".join(errors) if errors else None
-        )
-
-        logger.info(
-            f"✅ Scrape complete: {len(channels_found)} found, "
-            f"{channels_updated} updated, {channels_failed} failed"
-        )
-
-        return {
-            "success": status == "success",
-            "channels_found": len(channels_found),
-            "channels_updated": channels_updated,
-            "channels_failed": channels_failed,
-            "error": "; ".join(errors) if errors else None,
-            "channels": channels_found
-        }
-
-    async def scrape_single_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
-        """
-        Scrape a single channel by its numeric ID and update the DB immediately.
-        Used for on-demand refresh when a URL is found to be expired at playback time.
-
-        Returns the updated channel_data dict, or None if scraping failed.
-        """
-        logger.info(f"🔄 On-demand scrape for channel {channel_id}...")
-        url = f"{self.BASE_URL}{channel_id}"
-
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                response = await client.get(url, headers=self.headers)
-
-            if response.status_code != 200:
-                logger.warning(f"⚠️ On-demand scrape channel {channel_id}: HTTP {response.status_code}")
-                return None
-
-            html = response.text
-
-            name_match = re.search(r'<h1 id="streamName"[^>]*>(.*?)</h1>', html)
-            url_match = re.search(r'var streamUrl = "(.*?)";', html)
-
-            if not (name_match and url_match):
-                logger.warning(f"⚠️ On-demand scrape channel {channel_id}: could not extract data from page")
-                return None
-
-            name = name_match.group(1).strip()
-            stream_url = url_match.group(1).strip()
-
-            if not stream_url or ("mpd" not in stream_url.lower() and "m3u8" not in stream_url.lower()):
-                logger.warning(f"⚠️ On-demand scrape channel {channel_id}: no valid stream URL found")
-                return None
-
-            url_expires_at = datetime.utcnow() + timedelta(hours=self.TOKEN_EXPIRY_HOURS)
-            channel_data = {
-                "channelId": channel_id,
-                "name": name,
-                "streamUrl": stream_url,
-                "urlExpiresAt": url_expires_at,
-                "lastScrapedAt": datetime.utcnow(),
-                "status": "active",
-                "updatedAt": datetime.utcnow()
-            }
-
-            await self.channels_col.update_one(
-                {"channelId": channel_id},
-                {"$set": channel_data},
-                upsert=True
-            )
-
-            logger.info(f"✅ On-demand scrape channel {channel_id} ({name}): fresh URL saved, expires at {url_expires_at.isoformat()}")
-            return channel_data
-
-        except Exception as e:
-            logger.error(f"❌ On-demand scrape channel {channel_id} failed: {e}")
-            return None
-
-    async def get_channel_by_id(self, channel_id: int) -> Optional[Dict[str, Any]]:
-        """Get a channel by its ID."""
-        return await self.channels_col.find_one({"channelId": channel_id})
-
-    async def get_all_channels(self) -> List[Dict[str, Any]]:
-        """Get all channels."""
-        cursor = self.channels_col.find({}).sort("channelId", 1)
-        return await cursor.to_list(None)
-
-    async def get_active_channels(self) -> List[Dict[str, Any]]:
-        """Get only active channels with valid URLs."""
-        cursor = self.channels_col.find({
-            "status": "active",
-            "urlExpiresAt": {"$gt": datetime.utcnow()}
-        }).sort("channelId", 1)
-        return await cursor.to_list(None)
-
-    async def mark_channel_inactive(self, channel_id: int) -> None:
-        """Mark a channel as inactive."""
-        await self.channels_col.update_one(
-            {"channelId": channel_id},
-            {"$set": {"status": "inactive", "updatedAt": datetime.utcnow()}}
-        )
-
-    async def _log_scraper_run(
-        self,
-        run_started_at: datetime,
-        channels_scraped: int,
-        channels_updated: int,
-        channels_failed: int,
-        status: str,
-        error_message: Optional[str] = None
-    ) -> None:
-        """Log a scraper run to the database."""
         log_entry = {
-            "runStartedAt": run_started_at,
-            "runCompletedAt": datetime.utcnow(),
-            "channelsScraped": channels_scraped,
+            "timestamp": run_started_at,
+            "endedAt": run_ended_at,
+            "durationSeconds": duration_seconds,
+            "channelsScanned": max_channels,
+            "channelsFound": len(channels_found),
             "channelsUpdated": channels_updated,
             "channelsFailed": channels_failed,
-            "status": status,
-            "errorMessage": error_message,
-            "createdAt": datetime.utcnow()
+            "status": "success" if channels_found else "failed",
+            "errors": errors if errors else None
         }
 
         try:
             await self.logs_col.insert_one(log_entry)
-            logger.info(f"📝 Scraper run logged: {status}")
+            logger.info(f"📝 Scrape log saved")
         except Exception as e:
-            logger.error(f"❌ Failed to log scraper run: {str(e)}")
+            logger.error(f"Failed to save scrape log: {str(e)}")
 
-    async def get_recent_logs(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent scraper logs."""
-        cursor = self.logs_col.find({}).sort("createdAt", -1).limit(limit)
-        return await cursor.to_list(limit)
-
-    async def get_scraper_stats(self) -> Dict[str, Any]:
-        """Get scraper statistics."""
-        total_channels = await self.channels_col.count_documents({})
-        active_channels = await self.channels_col.count_documents({"status": "active"})
-
-        last_log = await self.logs_col.find_one({}, sort=[("createdAt", -1)])
-
-        # Calculate success rate from last 10 runs
-        recent_logs = await self.get_recent_logs(10)
-        success_count = sum(1 for log in recent_logs if log.get("status") == "success")
-        success_rate = success_count / len(recent_logs) if recent_logs else 0
-
-        # Calculate average scrape duration
-        durations = []
-        for log in recent_logs:
-            if log.get("runCompletedAt") and log.get("runStartedAt"):
-                duration = (log["runCompletedAt"] - log["runStartedAt"]).total_seconds()
-                durations.append(duration)
-
-        avg_duration = sum(durations) / len(durations) if durations else 0
+        success = len(channels_found) > 0
+        logger.info(f"✅ Scrape complete: {len(channels_found)} channels found, {channels_updated} updated")
 
         return {
-            "totalChannels": total_channels,
-            "activeChannels": active_channels,
-            "lastScraperRun": last_log.get("createdAt").isoformat() if last_log else None,
-            "lastScraperStatus": last_log.get("status") if last_log else None,
-            "successRate": round(success_rate, 2),
-            "averageScrapeDuration": round(avg_duration, 2),
-            "nextScheduledRun": (
-                (last_log.get("createdAt") + timedelta(hours=self.TOKEN_EXPIRY_HOURS)).isoformat()
-                if last_log else None
-            )
+            "success": success,
+            "channels_found": len(channels_found),
+            "channels_updated": channels_updated,
+            "channels_failed": channels_failed,
+            "error": errors[0] if errors else None,
+            "channels": channels_found
         }
+
+    async def get_fresh_channels(self) -> List[Dict]:
+        """
+        Get all channels that haven't expired yet.
+
+        Returns:
+            List of fresh channel documents
+        """
+        try:
+            channels = await self.channels_col.find(
+                {
+                    "status": "active",
+                    "urlExpiresAt": {"$gt": datetime.utcnow()}
+                }
+            ).to_list(None)
+
+            logger.info(f"📺 Retrieved {len(channels)} fresh channels")
+            return channels
+        except Exception as e:
+            logger.error(f"Error retrieving fresh channels: {str(e)}")
+            return []
+
+    async def get_channel_by_id(self, channel_id: int) -> Optional[Dict]:
+        """
+        Get a specific channel by ID.
+
+        Args:
+            channel_id: Channel ID to retrieve
+
+        Returns:
+            Channel document or None if not found
+        """
+        try:
+            channel = await self.channels_col.find_one(
+                {
+                    "channelId": channel_id,
+                    "status": "active"
+                }
+            )
+            return channel
+        except Exception as e:
+            logger.error(f"Error retrieving channel {channel_id}: {str(e)}")
+            return None
