@@ -1501,10 +1501,43 @@ def is_rate_limited(identifier: str) -> bool:
 
 class AppIdentityMiddleware(BaseHTTPMiddleware):
     """
-    Validates app requests using Bearer token + X-DEVICE-ID + optional X-Client-Sig.
-    User-Agent is logged but NOT used as a gate — Android WebView UAs vary by device.
-    Real security: PUBLIC_API_TOKEN (Bearer) + APP_CLIENT_SECRET (X-Client-Sig).
+    Validates app requests using Bearer token + X-DEVICE-ID + X-Client-Sig HMAC.
+
+    The Android app signs:
+        HMAC-SHA256(APP_CLIENT_SECRET, "METHOD\\nPATH\\nDEVICE_ID\\nTS\\nNONCE\\nBODY_HASH")
+    and sends the hex digest as X-Client-Sig together with X-CLIENT-TS and X-CLIENT-NONCE.
+
+    The server recomputes the same digest and compares with constant-time compare_digest.
+    Requests whose timestamp is >5 min old are rejected to prevent replay attacks.
     """
+
+    # Maximum clock skew / replay window in seconds
+    _SIG_MAX_AGE = 300
+
+    @staticmethod
+    def _verify_hmac_sig(
+        secret: str,
+        sig: str,
+        method: str,
+        path: str,
+        device_id: str,
+        ts: str,
+        nonce: str,
+        body: bytes,
+    ) -> bool:
+        """Return True iff sig matches the expected HMAC-SHA256 of the canonical string."""
+        body_hash = hashlib.sha256(body).hexdigest()
+        canonical = "\n".join([method.upper(), path, device_id, ts, nonce, body_hash])
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            canonical.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        try:
+            return hmac.compare_digest(sig, expected)
+        except (TypeError, ValueError):
+            return False
+
     async def dispatch(self, request: StarletteRequest, call_next):
         path = request.url.path
         client_ip = request.client.host if request.client else "?"
@@ -1526,8 +1559,32 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
 
         # 1. X-Client-Sig — enforce if APP_CLIENT_SECRET is configured
         if APP_CLIENT_SECRET:
-            sig = request.headers.get("x-client-sig", "")
-            if not sig or not hmac.compare_digest(sig, APP_CLIENT_SECRET):
+            sig       = request.headers.get("x-client-sig", "")
+            ts        = request.headers.get("x-client-ts", "")
+            nonce     = request.headers.get("x-client-nonce", "")
+            device_id = request.headers.get("x-device-id", "")
+
+            # Read body once; cache it so downstream handlers can still read it
+            body = await request.body()
+
+            # Validate timestamp to block replay attacks
+            ts_ok = False
+            try:
+                ts_age = abs(time.time() - float(ts))
+                ts_ok = ts_age <= self._SIG_MAX_AGE
+            except (TypeError, ValueError):
+                pass
+
+            sig_valid = (
+                bool(sig)
+                and ts_ok
+                and self._verify_hmac_sig(
+                    APP_CLIENT_SECRET, sig,
+                    request.method, path, device_id, ts, nonce, body,
+                )
+            )
+
+            if not sig_valid:
                 logger.warning(
                     f"🚫 Blocked — bad X-Client-Sig | path={path} ip={client_ip} "
                     f"ua={request.headers.get('user-agent', '')[:60]}"
