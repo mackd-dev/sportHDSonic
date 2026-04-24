@@ -2179,22 +2179,23 @@ async def register_device(payload: dict, request: Request):
 
     cleaned_updates = {k: v for k, v in update_fields.items() if v is not None}
 
-    if not device:
-        to_insert = {
-            "uuid": uuid_,
-            "isPremium": False,
-            "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
-            "trialUsed": False,
-            "createdAt": now,
-            "lastSeen": now,
-            "lastIp": client_ip,
-        }
-        to_insert.update(cleaned_updates)
-        await devices_col.insert_one(to_insert)
-        device = to_insert
-    else:
-        await devices_col.update_one({"uuid": uuid_}, {"$set": cleaned_updates})
-        device.update(cleaned_updates)
+    # Atomic upsert — safe against concurrent registrations from the same UUID.
+    # $setOnInsert only fires when a new document is created (no-op on update),
+    # so we never overwrite isPremium / trialRemaining on re-registration.
+    await devices_col.update_one(
+        {"uuid": uuid_},
+        {
+            "$setOnInsert": {
+                "isPremium": False,
+                "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
+                "trialUsed": False,
+                "createdAt": now,
+            },
+            "$set": cleaned_updates,
+        },
+        upsert=True,
+    )
+    device = await devices_col.find_one({"uuid": uuid_}) or {}
 
     blocked = _device_blocked(device)
 
