@@ -13,6 +13,7 @@ import re
 import httpx
 import base64
 import binascii
+import ipaddress
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from urllib.parse import urljoin, quote, unquote, urlparse
@@ -166,6 +167,7 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 
 from fastapi import FastAPI, Header, HTTPException, Body, Request, Depends, status
+from starlette.requests import Request as StarletteRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -261,6 +263,11 @@ PUBLIC_API_TOKEN = os.getenv("PUBLIC_API_TOKEN", "")
 # Must match APP_CLIENT_SECRET in local.properties / CI env.
 # Generate: python3 -c "import secrets; print(secrets.token_hex(16))"
 APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", "")
+
+# ── IP guard / anti-clone protection ───────────────────────────────────────
+IP_GUARD_ENABLED = os.getenv("IP_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+IP_GUARD_AUTO_BLOCK = os.getenv("IP_GUARD_AUTO_BLOCK", "true").strip().lower() not in ("0", "false", "no", "off")
+IP_GUARD_TRUST_PROXY = os.getenv("IP_GUARD_TRUST_PROXY", "true").strip().lower() not in ("0", "false", "no", "off")
 
 # Bypass code used to authenticate with the stream source scraper
 ASPORTSHD_BYPASS_CODE = os.getenv("ASPORTSHD_BYPASS_CODE", "491YWB317")
@@ -386,10 +393,7 @@ schedules_col = db.schedules
 vipindi_col = db.vipindi
 reminders_col = db.reminders
 banners_col = db.banners
-ip_registry_col = db.ip_registry  # 🛡️ IP Guard: tracks IP → UUID bindings
-
-# IP Guard: auto-block threshold (clones before automatic block)
-IP_GUARD_AUTO_BLOCK_THRESHOLD = int(os.getenv("IP_GUARD_AUTO_BLOCK_THRESHOLD", "3"))
+ip_registry_col = db.ip_registry
 
 # Channel Link Manager scheduler handle
 channel_scheduler = None  # initialized on startup
@@ -1007,6 +1011,11 @@ def verify_zeno_signature(payload: dict, signature: str) -> bool:
     
     return is_valid
 
+def _copy_label(value: Optional[str], suffix: str = "Copy") -> str:
+    base = str(value or "").strip()
+    return f"{base} {suffix}".strip() if base else suffix
+
+
 def extract_channel_id_from_url(url: str) -> Optional[str]:
     """Extract channel ID from player.php?c=X URL"""
     match = re.search(r'[?&]c=([^&]+)', url)
@@ -1215,6 +1224,230 @@ app.add_middleware(
     allow_methods=["*"]
 )
 
+
+
+def _safe_iso(value):
+    if value and hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def get_client_ip(request: Request | StarletteRequest) -> str:
+    if not request:
+        return ""
+
+    candidates = []
+    if IP_GUARD_TRUST_PROXY:
+        cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+        real_ip = request.headers.get("x-real-ip", "").strip()
+        xff = request.headers.get("x-forwarded-for", "").strip()
+        forwarded = request.headers.get("forwarded", "").strip()
+        if cf_ip:
+            candidates.append(cf_ip)
+        if real_ip:
+            candidates.append(real_ip)
+        if xff:
+            candidates.extend([part.strip() for part in xff.split(",") if part.strip()])
+        if forwarded:
+            for part in forwarded.split(";"):
+                part = part.strip()
+                if part.lower().startswith("for="):
+                    candidates.append(part.split("=", 1)[1].strip('"[]'))
+
+    if getattr(request, "client", None) and getattr(request.client, "host", None):
+        candidates.append(str(request.client.host).strip())
+
+    for raw in candidates:
+        try:
+            cleaned = raw.strip().strip('"[]')
+            if not cleaned:
+                continue
+            ipaddress.ip_address(cleaned)
+            return cleaned
+        except Exception:
+            continue
+    return ""
+
+
+def _is_guardable_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+        return not any([
+            addr.is_private,
+            addr.is_loopback,
+            addr.is_link_local,
+            addr.is_multicast,
+            addr.is_reserved,
+            addr.is_unspecified,
+        ])
+    except Exception:
+        return False
+
+
+def _device_fingerprint(payload: dict | None = None, device: dict | None = None) -> str:
+    payload = payload or {}
+    device = device or {}
+    parts = [
+        payload.get("deviceModel") or payload.get("device_model") or device.get("deviceModel") or device.get("device_model"),
+        payload.get("brand") or device.get("brand"),
+        payload.get("manufacturer") or device.get("manufacturer"),
+        payload.get("osVersion") or payload.get("os_version") or device.get("osVersion") or device.get("os_version"),
+        payload.get("appVersion") or payload.get("app_version") or device.get("appVersion") or device.get("app_version"),
+    ]
+    cleaned = [str(x).strip() for x in parts if str(x or "").strip()]
+    return " | ".join(cleaned)
+
+
+def _device_blocked(device: dict | None) -> bool:
+    if not device:
+        return False
+    return _as_bool(device.get("isBlocked") if device.get("isBlocked") is not None else device.get("is_blocked"))
+
+
+def _assert_device_not_blocked(device: dict | None, context: str = "Device blocked") -> None:
+    if _device_blocked(device):
+        reason = (device or {}).get("blockReason") or (device or {}).get("block_reason") or context
+        raise HTTPException(status_code=403, detail=reason)
+
+
+def _serialize_ip_record(doc: dict) -> dict:
+    uuids = [u for u in (doc.get("uuids") or []) if u]
+    status = doc.get("status") or ("BLOCKED" if doc.get("bound_device_blocked") else "CLONED" if int(doc.get("clone_attempts") or 0) > 0 else "CLEAN")
+    return {
+        "ip": doc.get("ip"),
+        "first_uuid": doc.get("first_uuid"),
+        "registered_at": _safe_iso(doc.get("registered_at")),
+        "last_seen": _safe_iso(doc.get("last_seen")),
+        "clone_attempts": int(doc.get("clone_attempts") or 0),
+        "last_clone_uuid": doc.get("last_clone_uuid"),
+        "last_clone_at": _safe_iso(doc.get("last_clone_at")),
+        "bound_device_blocked": _as_bool(doc.get("bound_device_blocked")),
+        "uuid_count": len(uuids) or int(doc.get("uuid_count") or 0),
+        "blocked_uuid": doc.get("blocked_uuid"),
+        "blocked_at": _safe_iso(doc.get("blocked_at")),
+        "block_reason": doc.get("block_reason"),
+        "status": status,
+    }
+
+
+async def apply_ip_guard(uuid_: str, request: Request | StarletteRequest, payload: dict | None = None, existing_device: dict | None = None) -> dict:
+    now = datetime.utcnow()
+    client_ip = get_client_ip(request)
+    result = {
+        "ip": client_ip or "unknown",
+        "guarded": False,
+        "block_device": False,
+        "reason": None,
+        "first_uuid": None,
+        "clone_attempts": 0,
+    }
+
+    if not IP_GUARD_ENABLED or not client_ip or not _is_guardable_ip(client_ip):
+        return result
+
+    result["guarded"] = True
+    fingerprint = _device_fingerprint(payload, existing_device)
+    record = await ip_registry_col.find_one({"ip": client_ip})
+
+    if not record:
+        await ip_registry_col.insert_one({
+            "ip": client_ip,
+            "first_uuid": uuid_,
+            "registered_at": now,
+            "last_seen": now,
+            "last_uuid": uuid_,
+            "clone_attempts": 0,
+            "last_clone_uuid": None,
+            "last_clone_at": None,
+            "bound_device_blocked": False,
+            "blocked_uuid": None,
+            "blocked_at": None,
+            "block_reason": None,
+            "first_fingerprint": fingerprint,
+            "uuids": [uuid_],
+            "uuid_count": 1,
+            "status": "CLEAN",
+        })
+        return result
+
+    first_uuid = record.get("first_uuid")
+    known_uuids = [u for u in (record.get("uuids") or []) if u]
+    if first_uuid and first_uuid not in known_uuids:
+        known_uuids.insert(0, first_uuid)
+
+    if uuid_ == first_uuid or uuid_ in known_uuids:
+        await ip_registry_col.update_one(
+            {"ip": client_ip},
+            {
+                "$set": {
+                    "last_seen": now,
+                    "last_uuid": uuid_,
+                    "uuid_count": len(set(known_uuids or [uuid_])),
+                },
+                "$addToSet": {"uuids": uuid_},
+            },
+        )
+        result["first_uuid"] = first_uuid
+        result["clone_attempts"] = int(record.get("clone_attempts") or 0)
+        return result
+
+    clone_attempts = int(record.get("clone_attempts") or 0) + 1
+    reason = (
+        f"IP Guard auto-block: IP {client_ip} was first tied to {first_uuid or 'unknown'} "
+        f"and later re-registered with UUID {uuid_}."
+    )
+
+    update_doc = {
+        "last_seen": now,
+        "last_uuid": uuid_,
+        "clone_attempts": clone_attempts,
+        "last_clone_uuid": uuid_,
+        "last_clone_at": now,
+        "uuid_count": len(set(known_uuids + [uuid_])),
+        "status": "BLOCKED" if IP_GUARD_AUTO_BLOCK else "CLONED",
+    }
+    if IP_GUARD_AUTO_BLOCK:
+        update_doc.update({
+            "bound_device_blocked": True,
+            "blocked_uuid": uuid_,
+            "blocked_at": now,
+            "block_reason": reason,
+        })
+
+    await ip_registry_col.update_one(
+        {"ip": client_ip},
+        {
+            "$set": update_doc,
+            "$addToSet": {"uuids": uuid_},
+        },
+    )
+
+    if IP_GUARD_AUTO_BLOCK:
+        await devices_col.update_one(
+            {"uuid": uuid_},
+            {"$set": {
+                "isBlocked": True,
+                "blockReason": reason,
+                "blockedAt": now,
+                "ipGuardFlagged": True,
+                "lastIp": client_ip,
+            }},
+        )
+
+    result.update({
+        "block_device": IP_GUARD_AUTO_BLOCK,
+        "reason": reason,
+        "first_uuid": first_uuid,
+        "clone_attempts": clone_attempts,
+    })
+    return result
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 🔒 APP IDENTITY GUARD — rejects requests that don't come from the real app
 #
@@ -1226,17 +1459,21 @@ app.add_middleware(
 # (so existing deployments don't break before you add the env var).
 # ═══════════════════════════════════════════════════════════════════════════
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse
 
 # Prefixes that bypass the sig check entirely
 _SIG_EXEMPT_PREFIXES = (
     "/admin",
     "/webhooks",
+    "/payway/webhooks",    # PayWay-branded webhook aliases
     "/payment-webhook",
     "/api/schedules",
     "/api/vipindi",
+    "/api/channels",      # admin panel still uses this legacy path
     "/api/relay",          # relay has its own token auth
+    "/api/clearkey",       # ExoPlayer calls this directly for ClearKey DRM — no app headers
+    "/api/mpd",            # ClearKey MPD proxy — secured by session token
+    "/api/hls",            # HLS proxy — stateless
     "/proxy",
     "/hls",
     "/ts",
@@ -1264,9 +1501,9 @@ def is_rate_limited(identifier: str) -> bool:
 
 class AppIdentityMiddleware(BaseHTTPMiddleware):
     """
-    Validates requests based on User-Agent, Authorization, and X-DEVICE-ID.
-    X-Client-Sig is no longer strictly enforced.
-    Includes simple rate limiting and Docker IP allowlisting.
+    Validates app requests using Bearer token + X-DEVICE-ID + optional X-Client-Sig.
+    User-Agent is logged but NOT used as a gate — Android WebView UAs vary by device.
+    Real security: PUBLIC_API_TOKEN (Bearer) + APP_CLIENT_SECRET (X-Client-Sig).
     """
     async def dispatch(self, request: StarletteRequest, call_next):
         path = request.url.path
@@ -1276,40 +1513,47 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
         if path in ("/", "/health") or request.method == "OPTIONS":
             return await call_next(request)
 
-        # Always allow exempt prefixes
+        # Always allow exempt prefixes (admin, webhooks, DRM endpoints, etc.)
         if any(path.startswith(p) for p in _SIG_EXEMPT_PREFIXES):
             return await call_next(request)
 
-        # Allow internal Docker traffic (e.g., 172.17.0.1 or 172.x.x.x)
+        # Allow internal Docker/loopback traffic
         if client_ip.startswith("172.") or client_ip in ("127.0.0.1", "::1"):
             return await call_next(request)
 
-        # 1. Validate User-Agent
-        user_agent = request.headers.get("user-agent", "")
-        if "PixTvMax-Android" not in user_agent:
-            logger.warning(f"🚫 Blocked request — Invalid User-Agent: {user_agent[:60]} | path={path} ip={client_ip}")
-            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+        # /device/register only needs X-DEVICE-ID (no Bearer yet at registration)
+        is_bootstrap = path in {"/device/register"}
 
-        # 2. Validate Authorization header
-        auth_header = request.headers.get("authorization", "")
-        if not auth_header.startswith("Bearer "):
-            logger.warning(f"🚫 Blocked request — Missing/Invalid Authorization header | path={path} ip={client_ip}")
-            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+        # 1. X-Client-Sig — enforce if APP_CLIENT_SECRET is configured
+        if APP_CLIENT_SECRET:
+            sig = request.headers.get("x-client-sig", "")
+            if not sig or not hmac.compare_digest(sig, APP_CLIENT_SECRET):
+                logger.warning(
+                    f"🚫 Blocked — bad X-Client-Sig | path={path} ip={client_ip} "
+                    f"ua={request.headers.get('user-agent', '')[:60]}"
+                )
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
-        # 3. Validate X-DEVICE-ID header
+        # 2. X-DEVICE-ID — required on all app routes
         device_id = request.headers.get("x-device-id", "")
         if not device_id:
-            logger.warning(f"🚫 Blocked request — Missing X-DEVICE-ID header | path={path} ip={client_ip}")
+            logger.warning(f"🚫 Blocked — missing X-DEVICE-ID | path={path} ip={client_ip}")
             return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
-        # Optional: Validate X-Client-Sig if present, but do not require it
-        sig = request.headers.get("x-client-sig", "")
-        if sig and APP_CLIENT_SECRET and sig != APP_CLIENT_SECRET:
-            logger.warning(f"⚠️ Invalid X-Client-Sig provided (ignoring) | path={path} ip={client_ip}")
+        # 3. Bearer token — required on all routes except bootstrap
+        if not is_bootstrap:
+            auth_header = request.headers.get("authorization", "")
+            if not auth_header.startswith("Bearer "):
+                logger.warning(f"🚫 Blocked — missing Bearer token | path={path} ip={client_ip}")
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+            provided_token = auth_header[7:].strip()
+            if not PUBLIC_API_TOKEN or not hmac.compare_digest(provided_token, PUBLIC_API_TOKEN):
+                logger.warning(f"🚫 Blocked — invalid Bearer token | path={path} ip={client_ip}")
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
-        # Rate Limiting per Device ID
+        # 4. Rate limiting per device
         if is_rate_limited(device_id):
-            logger.warning(f"🚫 Blocked request — Rate limit exceeded for device={device_id} | path={path} ip={client_ip}")
+            logger.warning(f"🚫 Rate limited | device={device_id} path={path} ip={client_ip}")
             return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
 
         logger.debug(f"✅ Request validated | path={path} ip={client_ip} device={device_id}")
@@ -1351,6 +1595,150 @@ async def set_payment_provider(
 
 
 # 🆕 Channel Link Manager routes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALIAS ADMIN ROUTES — /admin/aliases
+# Reads from the channel_aliases collection (same one the scraper writes to).
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/admin/aliases")
+async def admin_list_aliases(admin: dict = Depends(get_current_admin)):
+    """Return all aliases for the admin panel."""
+    from bson import ObjectId as _OID
+    docs = await db.channel_aliases.find({}).to_list(length=500)
+    return {"aliases": [
+        {
+            "id":          str(d.get("_id", "")),
+            "alias":       d.get("alias", ""),
+            "channelId":   d.get("channelId"),
+            "channelName": d.get("channelName") or d.get("name"),
+            "animalName":  d.get("animalName", ""),
+            "description": d.get("description"),
+            "isActive":    d.get("isActive", True),
+        }
+        for d in docs
+    ]}
+
+
+@app.post("/admin/aliases")
+async def admin_create_alias(
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin),
+):
+    import random, string as _string
+    channel_id  = payload.get("channelId")
+    animal_name = (payload.get("animalName") or "").strip().lower()
+    description = payload.get("description")
+    if not channel_id or not animal_name:
+        raise HTTPException(400, "channelId and animalName are required")
+
+    # Build a unique alias like "paka.xvwqr"
+    for _ in range(5):
+        suffix = "".join(random.choices(_string.ascii_lowercase, k=5))
+        alias  = f"{animal_name}.{suffix}"
+        if not await db.channel_aliases.find_one({"alias": alias}):
+            break
+
+    ch = await channels_col.find_one({"id": str(channel_id)})
+    now = datetime.utcnow()
+    doc = {
+        "alias":       alias,
+        "channelId":   str(channel_id),
+        "channelName": ch.get("name") if ch else None,
+        "animalName":  animal_name,
+        "description": description,
+        "isActive":    True,
+        "createdAt":   now,
+        "updatedAt":   now,
+    }
+    result = await db.channel_aliases.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    logger.info(f"Alias created: {alias} -> channelId={channel_id}")
+    return {"status": "ok", "alias": doc}
+
+
+@app.put("/admin/aliases/{alias_id}")
+async def admin_update_alias(
+    alias_id: str,
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin),
+):
+    from bson import ObjectId as _OID
+    if not _OID.is_valid(alias_id):
+        raise HTTPException(400, "Invalid alias ID")
+    update = {"updatedAt": datetime.utcnow()}
+    if "description" in payload:
+        update["description"] = payload["description"]
+    if "isActive" in payload:
+        update["isActive"] = bool(payload["isActive"])
+    res = await db.channel_aliases.update_one({"_id": _OID(alias_id)}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Alias not found")
+    return {"status": "ok"}
+
+
+@app.delete("/admin/aliases/{alias_id}")
+async def admin_delete_alias(
+    alias_id: str,
+    admin: dict = Depends(get_current_admin),
+):
+    from bson import ObjectId as _OID
+    if not _OID.is_valid(alias_id):
+        raise HTTPException(400, "Invalid alias ID")
+    res = await db.channel_aliases.delete_one({"_id": _OID(alias_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Alias not found")
+    logger.info(f"Alias deleted: {alias_id}")
+    return {"status": "ok"}
+
+@app.post("/admin/aliases/{alias_id}/duplicate")
+async def admin_duplicate_alias(
+    alias_id: str,
+    admin: dict = Depends(get_current_admin),
+):
+    from bson import ObjectId as _OID
+    import random, string as _string
+
+    if not _OID.is_valid(alias_id):
+        raise HTTPException(400, "Invalid alias ID")
+
+    original = await db.channel_aliases.find_one({"_id": _OID(alias_id)})
+    if not original:
+        raise HTTPException(404, "Alias not found")
+
+    animal_name = (original.get("animalName") or str(original.get("alias") or "copy").split(".")[0]).strip().lower()
+    channel_id = str(original.get("channelId") or "").strip()
+    if not channel_id:
+        raise HTTPException(400, "Original alias is missing channelId")
+
+    alias = None
+    for _ in range(10):
+        suffix = "".join(random.choices(_string.ascii_lowercase, k=5))
+        candidate = f"{animal_name}.{suffix}"
+        if not await db.channel_aliases.find_one({"alias": candidate}):
+            alias = candidate
+            break
+
+    if not alias:
+        raise HTTPException(500, "Could not generate duplicate alias")
+
+    ch = await channels_col.find_one({"id": channel_id})
+    now = datetime.utcnow()
+    doc = {
+        "alias": alias,
+        "channelId": channel_id,
+        "channelName": (ch or {}).get("name") or original.get("channelName"),
+        "animalName": animal_name,
+        "description": original.get("description"),
+        "isActive": original.get("isActive", True),
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = await db.channel_aliases.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    return {"status": "ok", "alias": doc}
+
 setup_channel_routes(app, db, get_current_admin)
 
 
@@ -1396,7 +1784,10 @@ async def startup():
     await payments_col.create_index("order_id")
     await payments_col.create_index("status")
     await devices_col.create_index("uuid", unique=True)
-    await ip_registry_col.create_index("ip", unique=True)  # 🛡️ IP Guard index
+    await devices_col.create_index("lastIp")
+    await ip_registry_col.create_index("ip", unique=True)
+    await ip_registry_col.create_index("first_uuid")
+    await ip_registry_col.create_index("last_clone_uuid")
     
     # ✅ ZENO STARTUP VALIDATION
     if not ZENO_API_KEY:
@@ -1578,6 +1969,21 @@ async def delete_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
     return {"status": "success"}
 
+@app.post("/api/schedules/{schedule_id}/duplicate")
+@app.post("/admin/schedules/{schedule_id}/duplicate")
+async def duplicate_schedule(schedule_id: str, admin: dict = Depends(get_current_admin)):
+    original = await schedules_col.find_one({"id": schedule_id})
+    if not original:
+        raise HTTPException(404, "Schedule not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["homeTeam"] = _copy_label(original.get("homeTeam") or original.get("home_team"))
+
+    await schedules_col.insert_one(new_doc)
+    saved_doc = await schedules_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VIPINDI (TV Programs / Shows) ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1614,6 +2020,25 @@ async def create_or_update_kipindi(
     )
     return {"status": "success", "id": kipindi_id}
 
+@app.put("/api/vipindi/{kipindi_id}")
+@app.put("/admin/vipindi/{kipindi_id}")
+async def update_kipindi(
+    kipindi_id: str,
+    kipindi: Kipindi,
+    admin: dict = Depends(get_current_admin)
+):
+    kipindi_dict = kipindi.dict()
+    kipindi_dict["id"] = kipindi_id
+    existing = await vipindi_col.find_one({"id": kipindi_id})
+    kipindi_dict["createdAt"] = (existing or {}).get("createdAt") or datetime.utcnow().isoformat()
+    await vipindi_col.update_one(
+        {"id": kipindi_id},
+        {"$set": kipindi_dict},
+        upsert=True,
+    )
+    saved_doc = await vipindi_col.find_one({"id": kipindi_id})
+    return serialize_doc(saved_doc, for_admin=True)
+
 @app.delete("/api/vipindi/{kipindi_id}")
 @app.delete("/admin/vipindi/{kipindi_id}")
 async def delete_kipindi(
@@ -1624,6 +2049,22 @@ async def delete_kipindi(
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Kipindi not found")
     return {"status": "success"}
+
+@app.post("/api/vipindi/{kipindi_id}/duplicate")
+@app.post("/admin/vipindi/{kipindi_id}/duplicate")
+async def duplicate_kipindi(kipindi_id: str, admin: dict = Depends(get_current_admin)):
+    original = await vipindi_col.find_one({"id": kipindi_id})
+    if not original:
+        raise HTTPException(404, "Kipindi not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["name"] = _copy_label(original.get("name"))
+    new_doc["createdAt"] = datetime.utcnow().isoformat()
+
+    await vipindi_col.insert_one(new_doc)
+    saved_doc = await vipindi_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.post("/schedules/remind")
 async def add_reminder(payload: dict = Body(...)):
@@ -1649,124 +2090,65 @@ async def add_reminder(payload: dict = Body(...)):
         logger.error(f"Reminder Error: {e}")
         raise HTTPException(500, "Could not set reminder")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 🛡️ IP GUARD HELPER
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _ip_guard_record(ip: str, uuid_: str) -> None:
-    """
-    Called on every /device/register.
-    - First registration from an IP → creates a clean binding record.
-    - Same UUID from same IP → just updates last_seen (normal re-launch).
-    - Different UUID from same IP → clone attempt; increments counter.
-      Auto-blocks the device when clone_attempts reaches the threshold.
-    """
-    if not ip or ip in ("unknown", "127.0.0.1", "::1"):
-        return  # skip loopback / unknown
-
-    now = datetime.utcnow()
-    existing = await ip_registry_col.find_one({"ip": ip})
-
-    if not existing:
-        # Fresh binding — first time we've seen this IP
-        await ip_registry_col.insert_one({
-            "ip":                  ip,
-            "first_uuid":          uuid_,
-            "registered_at":       now,
-            "last_seen":           now,
-            "clone_attempts":      0,
-            "last_clone_uuid":     None,
-            "last_clone_at":       None,
-            "bound_device_blocked": False,
-            "uuid_count":          1,
-            "blocked_uuid":        None,
-            "blocked_at":          None,
-            "block_reason":        None,
-            "status":              "CLEAN",
-        })
-        logger.info(f"🛡️ IP Guard: New binding {ip} → {uuid_[:12]}…")
-        return
-
-    # Same UUID coming back — just refresh last_seen, nothing suspicious
-    if existing.get("first_uuid") == uuid_:
-        await ip_registry_col.update_one(
-            {"ip": ip},
-            {"$set": {"last_seen": now}}
-        )
-        return
-
-    # Different UUID from same IP → clone attempt
-    new_attempts  = existing.get("clone_attempts", 0) + 1
-    new_uuid_count = existing.get("uuid_count", 1) + 1
-    auto_block    = new_attempts >= IP_GUARD_AUTO_BLOCK_THRESHOLD
-
-    update = {
-        "last_seen":        now,
-        "clone_attempts":   new_attempts,
-        "last_clone_uuid":  uuid_,
-        "last_clone_at":    now,
-        "uuid_count":       new_uuid_count,
-    }
-
-    if auto_block and not existing.get("bound_device_blocked"):
-        reason = f"IP Guard auto-block after {new_attempts} clone attempts"
-        update["bound_device_blocked"] = True
-        update["blocked_uuid"]         = uuid_
-        update["blocked_at"]           = now
-        update["block_reason"]         = reason
-        update["status"]               = "BLOCKED"
-
-        # Also block the offending device in the devices collection
-        await devices_col.update_one(
-            {"uuid": uuid_},
-            {"$set": {"isBlocked": True, "blockReason": reason, "blockedAt": now}}
-        )
-        logger.warning(
-            f"🚫 IP Guard AUTO-BLOCK: {ip} ({new_attempts} clones) → blocked uuid={uuid_[:12]}…"
-        )
-    else:
-        update["status"] = "WATCHLIST" if new_attempts > 0 else "CLEAN"
-        logger.warning(
-            f"⚠️ IP Guard clone hit #{new_attempts}: {ip} "
-            f"(bound={existing.get('first_uuid','?')[:12]}… new={uuid_[:12]}…)"
-        )
-
-    await ip_registry_col.update_one({"ip": ip}, {"$set": update})
-
-
 @app.post("/device/register")
 async def register_device(payload: dict, request: Request):
-    uuid_ = payload.get("uuid")
-    if not uuid_: raise HTTPException(400, "UUID required")
+    uuid_ = str(payload.get("uuid") or "").strip()
+    if not uuid_:
+        raise HTTPException(400, "UUID required")
 
-    # 🛡️ IP Guard — track IP → UUID binding BEFORE creating the device record
-    client_ip = request.client.host if request.client else "unknown"
-    await _ip_guard_record(client_ip, uuid_)
-
+    now = datetime.utcnow()
+    flags = await get_admin_flags()
     device = await devices_col.find_one({"uuid": uuid_})
-    if not device:
-        flags = await get_admin_flags()
-        await devices_col.insert_one({
-            "uuid":           uuid_,
-            "isPremium":      False,
-            "trialRemaining": flags.get("trialSeconds", 300),
-            "createdAt":      datetime.utcnow(),
-            "lastSeen":       datetime.utcnow(),
-        })
-    else:
-        await devices_col.update_one(
-            {"uuid": uuid_},
-            {"$set": {"lastSeen": datetime.utcnow()}}
-        )
+    guard = await apply_ip_guard(uuid_, request, payload, existing_device=device)
+    client_ip = guard.get("ip") or get_client_ip(request) or "unknown"
 
-    # ✅ Return public_api_token so the app can authenticate all future requests.
-    # The app saves this as Bearer token (see ContentRepositoryImpl.kt).
-    # Accepts any of: public_api_token, app_token, auth_token, bearer_token
+    update_fields = {
+        "lastSeen": now,
+        "lastIp": client_ip,
+        "deviceModel": payload.get("deviceModel") or payload.get("device_model") or (device or {}).get("deviceModel"),
+        "osVersion": payload.get("osVersion") or payload.get("os_version") or (device or {}).get("osVersion"),
+        "appVersion": payload.get("appVersion") or payload.get("app_version") or (device or {}).get("appVersion"),
+        "brand": payload.get("brand") or (device or {}).get("brand"),
+        "manufacturer": payload.get("manufacturer") or (device or {}).get("manufacturer"),
+    }
+
+    if guard.get("block_device"):
+        update_fields.update({
+            "isBlocked": True,
+            "blockReason": guard.get("reason"),
+            "blockedAt": now,
+            "ipGuardFlagged": True,
+        })
+
+    cleaned_updates = {k: v for k, v in update_fields.items() if v is not None}
+
+    if not device:
+        to_insert = {
+            "uuid": uuid_,
+            "isPremium": False,
+            "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
+            "trialUsed": False,
+            "createdAt": now,
+            "lastSeen": now,
+            "lastIp": client_ip,
+        }
+        to_insert.update(cleaned_updates)
+        await devices_col.insert_one(to_insert)
+        device = to_insert
+    else:
+        await devices_col.update_one({"uuid": uuid_}, {"$set": cleaned_updates})
+        device.update(cleaned_updates)
+
+    blocked = _device_blocked(device)
+
     return {
-        "status":           "OK",
+        "status": "BLOCKED" if blocked else "OK",
         "public_api_token": PUBLIC_API_TOKEN,
-        "app_token":        PUBLIC_API_TOKEN,   # alternate field name the app also accepts
-        "uuid":             uuid_,
+        "app_token": PUBLIC_API_TOKEN,
+        "uuid": uuid_,
+        "blocked": blocked,
+        "blockReason": device.get("blockReason"),
+        "ipGuard": guard,
     }
 
 @app.get("/device/status/{uuid}")
@@ -1777,6 +2159,8 @@ async def device_status(uuid: str):
 
     # ✅ FIX: Use centralized expiry logic
     device = await maybe_auto_expire_premium(device)
+
+    _assert_device_not_blocked(device, "Device blocked by IP Guard")
 
     # ✅ SAFETY: Explicit type checking for isPremium
     is_premium_raw = device.get("isPremium") or device.get("is_premium")
@@ -1796,49 +2180,64 @@ async def device_status(uuid: str):
     }
 
 @app.get("/entitlement")
-async def get_entitlement(x_device_id: str = Header(None)):
+async def get_entitlement(request: Request, x_device_id: str = Header(None)):
     if not x_device_id:
         raise HTTPException(400, "X-DEVICE-ID header required")
-    
-    device = await devices_col.find_one({"uuid": x_device_id})
+
     now = datetime.utcnow()
     flags = await get_admin_flags()
+    device = await devices_col.find_one({"uuid": x_device_id})
+    client_ip = get_client_ip(request) or "unknown"
 
     if not device:
+        guard = await apply_ip_guard(x_device_id, request, {}, None)
         device = {
             "uuid": x_device_id,
             "isPremium": False,
-            "trialRemaining": flags.get("trialSeconds", 300),
+            "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
             "trialStartedAt": now,
             "trialUsed": False,
             "trialPausedAt": None,
             "lastChannelId": None,
             "createdAt": now,
-            "lastSeen": now
+            "lastSeen": now,
+            "lastIp": client_ip,
         }
+        if guard.get("block_device"):
+            device.update({
+                "isBlocked": True,
+                "blockReason": guard.get("reason"),
+                "blockedAt": now,
+                "ipGuardFlagged": True,
+            })
         await devices_col.insert_one(device)
     else:
-        # ✅ NEW: Check if Premium has expired when checking entitlement
+        await devices_col.update_one(
+            {"uuid": x_device_id},
+            {"$set": {"lastSeen": now, "lastIp": client_ip}},
+        )
+        device["lastSeen"] = now
+        device["lastIp"] = client_ip
         device = await maybe_auto_expire_premium(device)
-    
-    # ✅ SAFETY: Explicit type checking for isPremium
+
+    _assert_device_not_blocked(device, "Device blocked by IP Guard")
+
     is_premium_raw = device.get("isPremium") or device.get("is_premium")
     if isinstance(is_premium_raw, str):
         is_premium = is_premium_raw.lower() in ("true", "1", "yes")
     else:
         is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
-    
-    # Check if trial was already used (one-time enforcement)
+
     trial_used = device.get("trialUsed", False)
     trial_remaining = device.get("trialRemaining", 0)
-    
+
     return {
         "isPremium": is_premium,
         "subscriptionExpiresAt": int(device["premiumUntil"].timestamp() * 1000) if device.get("premiumUntil") else None,
         "trialRemainingSeconds": trial_remaining,
-        "trialUsed": trial_used,  # Inform app if trial was already used
+        "trialUsed": trial_used,
         "playerMode": flags.get("playerMode", "EXO"),
-        "maintenance": flags.get("maintenance", False)
+        "maintenance": flags.get("maintenance", False),
     }
 
 @app.post("/session/start")
@@ -1866,6 +2265,8 @@ async def start_session(payload: dict, request: Request):
 
     # ✅ Ensure /session/start applies auto-expiry BEFORE building the session response
     device = await maybe_auto_expire_premium(device)
+
+    _assert_device_not_blocked(device, "Device blocked. Contact support.")
 
     flags = await get_admin_flags()
     if flags.get("maintenance"):
@@ -2034,11 +2435,13 @@ async def start_session(payload: dict, request: Request):
                 channel.headers = {}
             channel.headers.update(resolved_alias["headers"])
 
-        # ✅ Fallback: Attach ClearKey statically if defined in CLEARKEY_BY_CHANNEL_ID
+        # ✅ Static ClearKey always wins over anything the scraper returned.
+        # The scraper may set drmType=WIDEVINE/licenseUrl for Azam channels that
+        # actually use ClearKey — the hardcoded map is the source of truth.
         if "CLEARKEY_BY_CHANNEL_ID" in globals() and stream_type == "DASH":
             clearkey = CLEARKEY_BY_CHANNEL_ID.get(resolved_alias["channelId"])
-            if clearkey and not channel.license_url:
-                logger.info(f"🔑 Found Static ClearKey for Alias Channel {resolved_alias['channelId']}")
+            if clearkey:
+                logger.info(f"🔑 ClearKey override for channelId={resolved_alias['channelId']}")
                 channel.drm_type = "CLEARKEY"
                 channel.license_url = clearkey
         
@@ -2131,6 +2534,11 @@ async def start_session(payload: dict, request: Request):
             mpd_url = f"{base_url}/api/mpd/clearkey-proxy/{token}"
             # logger.info(f"🔁 Using Android ClearKey MPD proxy: {mpd_url}")
 
+    # Compute server-side trial deadline so heartbeat never trusts app clock
+    _trial_deadline = None
+    if channel.is_premium and not user_is_premium and trial_remaining > 0:
+        _trial_deadline = datetime.utcnow() + timedelta(seconds=int(trial_remaining))
+
     await sessions_col.insert_one({
         "uuid": uuid_,
         "token": token,
@@ -2147,6 +2555,7 @@ async def start_session(payload: dict, request: Request):
         "player_mode": flags.get("playerMode", "EXO"),
         "channel_id": channel_id,
         "clearkey_mpd_proxy": use_clearkey_mpd_proxy,
+        "trialDeadlineAt": _trial_deadline,  # server-side deadline — never from app
     })
 
     if stream_type == "HLS":
@@ -2289,6 +2698,127 @@ async def admin_stats(admin: dict = Depends(get_current_admin)):
         "most_watched_channels": most_watched,
         "returning_customers": top_customers
     }
+
+
+@app.get("/admin/ip-registry")
+async def admin_ip_registry(
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    admin: dict = Depends(get_current_admin),
+):
+    query = {}
+    if search:
+        query["$or"] = [
+            {"ip": {"$regex": re.escape(search), "$options": "i"}},
+            {"first_uuid": {"$regex": re.escape(search), "$options": "i"}},
+            {"last_clone_uuid": {"$regex": re.escape(search), "$options": "i"}},
+            {"uuids": {"$elemMatch": {"$regex": re.escape(search), "$options": "i"}}},
+        ]
+
+    docs = await ip_registry_col.find(query).sort([
+        ("bound_device_blocked", -1),
+        ("clone_attempts", -1),
+        ("last_clone_at", -1),
+        ("last_seen", -1),
+    ]).to_list(None)
+
+    rows = [_serialize_ip_record(doc) for doc in docs]
+    normalized_status = (status or "").strip().upper()
+    if normalized_status == "CLONED":
+        rows = [row for row in rows if int(row.get("clone_attempts") or 0) > 0]
+    elif normalized_status == "BLOCKED":
+        rows = [row for row in rows if row.get("bound_device_blocked")]
+    elif normalized_status == "CLEAN":
+        rows = [row for row in rows if int(row.get("clone_attempts") or 0) == 0 and not row.get("bound_device_blocked")]
+
+    return rows
+
+
+@app.post("/admin/ip-registry/block")
+async def admin_ip_registry_block(payload: dict = Body(...), admin: dict = Depends(get_current_admin)):
+    ip = str(payload.get("ip") or "").strip()
+    reason = str(payload.get("reason") or "Manually blocked via IP Guard").strip()
+    if not ip:
+        raise HTTPException(400, "IP required")
+
+    now = datetime.utcnow()
+    record = await ip_registry_col.find_one({"ip": ip}) or {"ip": ip, "uuids": []}
+    first_uuid = record.get("first_uuid")
+    uuids = [u for u in (record.get("uuids") or []) if u]
+    if first_uuid and first_uuid not in uuids:
+        uuids.insert(0, first_uuid)
+
+    await ip_registry_col.update_one(
+        {"ip": ip},
+        {"$set": {
+            "bound_device_blocked": True,
+            "blocked_uuid": first_uuid or (uuids[0] if uuids else None),
+            "blocked_at": now,
+            "block_reason": reason,
+            "status": "BLOCKED",
+            "last_seen": record.get("last_seen") or now,
+            "registered_at": record.get("registered_at") or now,
+            "first_uuid": first_uuid,
+            "uuid_count": len(set(uuids)),
+        }},
+        upsert=True,
+    )
+
+    if uuids:
+        await devices_col.update_many(
+            {"uuid": {"$in": list(set(uuids))}},
+            {"$set": {"isBlocked": True, "blockReason": reason, "blockedAt": now}},
+        )
+
+    return {"status": "OK", "ip": ip, "blockedUuids": list(set(uuids))}
+
+
+@app.post("/admin/ip-registry/unblock")
+async def admin_ip_registry_unblock(payload: dict = Body(...), admin: dict = Depends(get_current_admin)):
+    ip = str(payload.get("ip") or "").strip()
+    uuid_ = str(payload.get("uuid") or "").strip()
+
+    record = None
+    if ip:
+        record = await ip_registry_col.find_one({"ip": ip})
+    elif uuid_:
+        record = await ip_registry_col.find_one({
+            "$or": [
+                {"first_uuid": uuid_},
+                {"blocked_uuid": uuid_},
+                {"uuids": uuid_},
+                {"last_clone_uuid": uuid_},
+            ]
+        })
+
+    uuids = []
+    if record:
+        first_uuid = record.get("first_uuid")
+        uuids = [u for u in (record.get("uuids") or []) if u]
+        if first_uuid and first_uuid not in uuids:
+            uuids.insert(0, first_uuid)
+        await ip_registry_col.delete_one({"ip": record.get("ip")})
+        ip = record.get("ip") or ip
+    elif uuid_:
+        uuids = [uuid_]
+
+    if uuids:
+        await devices_col.update_many(
+            {"uuid": {"$in": list(set(uuids))}},
+            {"$set": {"isBlocked": False}, "$unset": {"blockReason": "", "blockedAt": "", "ipGuardFlagged": ""}},
+        )
+
+    return {"status": "OK", "ip": ip, "unblockedUuids": list(set(uuids))}
+
+
+@app.delete("/admin/ip-registry/{ip}")
+async def admin_delete_ip_registry_record(ip: str, admin: dict = Depends(get_current_admin)):
+    decoded_ip = unquote(ip)
+    result = await ip_registry_col.delete_one({"ip": decoded_ip})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "IP record not found")
+    return {"status": "OK", "ip": decoded_ip}
+
 
 @app.get("/admin/users")
 async def admin_users(admin: dict = Depends(get_current_admin)):
@@ -2521,6 +3051,42 @@ async def admin_delete_channel(channel_id: str, admin: dict = Depends(get_curren
     await channels_col.delete_one({"id": channel_id})
     return {"status": "OK"}
 
+@app.post("/api/channels/bulk")
+@app.post("/admin/channels/bulk")
+async def admin_bulk_update_channels(payload: dict = Body(...), admin: dict = Depends(get_current_admin)):
+    ids = [str(v) for v in (payload.get("ids") or []) if str(v).strip()]
+    action = str(payload.get("action") or "").upper()
+    if not ids:
+        raise HTTPException(400, "ids are required")
+    if action not in {"ACTIVATE", "DEACTIVATE"}:
+        raise HTTPException(400, "action must be ACTIVATE or DEACTIVATE")
+
+    result = await channels_col.update_many(
+        {"id": {"$in": ids}},
+        {"$set": {"active": action == "ACTIVATE"}},
+    )
+    return {
+        "status": "success",
+        "matched": result.matched_count,
+        "modified": result.modified_count,
+    }
+
+@app.post("/api/channels/{channel_id}/duplicate")
+@app.post("/admin/channels/{channel_id}/duplicate")
+async def admin_duplicate_channel(channel_id: str, admin: dict = Depends(get_current_admin)):
+    original = await channels_col.find_one({"id": channel_id})
+    if not original:
+        raise HTTPException(404, "Channel not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["name"] = _copy_label(original.get("name"))
+    new_doc["order"] = int(original.get("order", 0) or 0) + 1
+
+    await channels_col.insert_one(new_doc)
+    saved_doc = await channels_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
+
 @app.get("/admin/categories")
 async def admin_categories(admin: dict = Depends(get_current_admin)):
     categories = await categories_col.find().sort("order", 1).to_list(None)
@@ -2534,7 +3100,20 @@ async def admin_create_category(category: Category, admin: dict = Depends(get_cu
     {"$set": category_dict},      # Update it with new data
     upsert=True                   # Create it if it doesn't exist
 )
-    return serialize_doc(category_dict, for_admin=True)
+    saved_doc = await categories_col.find_one({"id": category_dict["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
+
+@app.put("/admin/categories/{category_id}")
+async def admin_update_category(category_id: str, category: Category, admin: dict = Depends(get_current_admin)):
+    category_dict = category.dict()
+    category_dict["id"] = category_id
+    await categories_col.update_one(
+        {"id": category_id},
+        {"$set": category_dict},
+        upsert=True,
+    )
+    saved_doc = await categories_col.find_one({"id": category_id})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.delete("/admin/categories/{category_id}")
 async def admin_delete_category(category_id: str, admin: dict = Depends(get_current_admin)):
@@ -2554,6 +3133,21 @@ async def admin_reorder_categories(order_data: List[Dict[str, Any]], admin: dict
                 {"$set": {"order": item["order"]}}
             )
     return {"status": "OK"}
+
+@app.post("/admin/categories/{category_id}/duplicate")
+async def admin_duplicate_category(category_id: str, admin: dict = Depends(get_current_admin)):
+    original = await categories_col.find_one({"id": category_id})
+    if not original:
+        raise HTTPException(404, "Category not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["name"] = _copy_label(original.get("name"))
+    new_doc["order"] = int(original.get("order", 0) or 0) + 1
+
+    await categories_col.insert_one(new_doc)
+    saved_doc = await categories_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.get("/admin/banners")
 async def admin_banners(admin: dict = Depends(get_current_admin)):
@@ -2609,160 +3203,25 @@ async def admin_delete_banner(banner_id: str, admin: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail=f"Banner not found with ID: {banner_id}")
     return {"status": "success"}
 
+@app.post("/admin/banners/{banner_id}/duplicate")
+async def admin_duplicate_banner(banner_id: str, admin: dict = Depends(get_current_admin)):
+    from bson import ObjectId
+
+    original = await banners_col.find_one({"id": banner_id})
+    if not original and ObjectId.is_valid(banner_id):
+        original = await banners_col.find_one({"_id": ObjectId(banner_id)})
+    if not original:
+        raise HTTPException(404, "Banner not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["title"] = _copy_label(original.get("title"))
+
+    await banners_col.insert_one(new_doc)
+    saved_doc = await banners_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
+
 from bson import ObjectId
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 🛡️ IP GUARD ADMIN ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _serialize_ip_record(doc: dict) -> dict:
-    """Convert MongoDB ip_registry doc to the shape IpRecord.fromJson() expects."""
-    if not doc:
-        return {}
-    def _iso(v):
-        if v is None:
-            return None
-        if hasattr(v, "isoformat"):
-            return v.isoformat()
-        return str(v)
-    return {
-        "ip":                   doc.get("ip", ""),
-        "first_uuid":           doc.get("first_uuid"),
-        "registered_at":        _iso(doc.get("registered_at")),
-        "last_seen":            _iso(doc.get("last_seen")),
-        "clone_attempts":       doc.get("clone_attempts", 0),
-        "last_clone_uuid":      doc.get("last_clone_uuid"),
-        "last_clone_at":        _iso(doc.get("last_clone_at")),
-        "bound_device_blocked": doc.get("bound_device_blocked", False),
-        "uuid_count":           doc.get("uuid_count", 1),
-        "blocked_uuid":         doc.get("blocked_uuid"),
-        "blocked_at":           _iso(doc.get("blocked_at")),
-        "block_reason":         doc.get("block_reason"),
-        "status":               (doc.get("status") or "CLEAN").upper(),
-    }
-
-@app.get("/admin/ip-registry")
-async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
-    """Returns all IP registry records, newest activity first."""
-    docs = await ip_registry_col.find().sort("last_seen", -1).to_list(None)
-    return [_serialize_ip_record(d) for d in docs]
-
-
-@app.post("/admin/ip-registry/block")
-async def admin_ip_block(
-    payload: dict = Body(...),
-    admin: dict = Depends(get_current_admin)
-):
-    """
-    Manually block the device bound to an IP.
-    Body: { "ip": "x.x.x.x", "reason": "optional reason string" }
-    """
-    ip     = (payload.get("ip") or "").strip()
-    reason = (payload.get("reason") or "Manually blocked via IP Guard").strip()
-    if not ip:
-        raise HTTPException(400, "ip is required")
-
-    now = datetime.utcnow()
-    record = await ip_registry_col.find_one({"ip": ip})
-    if not record:
-        raise HTTPException(404, f"No IP Guard record found for {ip}")
-
-    bound_uuid = record.get("first_uuid")
-
-    # Block the device in devices collection
-    if bound_uuid:
-        await devices_col.update_one(
-            {"uuid": bound_uuid},
-            {"$set": {"isBlocked": True, "blockReason": reason, "blockedAt": now}}
-        )
-
-    # Update the IP registry record
-    await ip_registry_col.update_one(
-        {"ip": ip},
-        {"$set": {
-            "bound_device_blocked": True,
-            "blocked_uuid":         bound_uuid,
-            "blocked_at":           now,
-            "block_reason":         reason,
-            "status":               "BLOCKED",
-            "last_seen":            now,
-        }}
-    )
-    logger.info(f"🚫 Admin manually blocked IP {ip} (uuid={bound_uuid}) reason='{reason}'")
-    return {"status": "ok", "ip": ip, "blocked_uuid": bound_uuid}
-
-
-@app.post("/admin/ip-registry/unblock")
-async def admin_ip_unblock(
-    payload: dict = Body(...),
-    admin: dict = Depends(get_current_admin)
-):
-    """
-    Unblock and reset the IP record.
-    Body: { "ip": "x.x.x.x" }  OR  { "uuid": "device-uuid" }
-    Both fields are accepted; ip takes priority if provided.
-    """
-    ip        = (payload.get("ip") or "").strip() or None
-    uuid_     = (payload.get("uuid") or "").strip() or None
-
-    if not ip and not uuid_:
-        raise HTTPException(400, "Either ip or uuid is required")
-
-    # Resolve record
-    if ip:
-        record = await ip_registry_col.find_one({"ip": ip})
-    else:
-        # Lookup by first_uuid or blocked_uuid
-        record = await ip_registry_col.find_one({
-            "$or": [{"first_uuid": uuid_}, {"blocked_uuid": uuid_}]
-        })
-
-    if not record:
-        raise HTTPException(404, "No IP Guard record found")
-
-    ip        = record["ip"]
-    bound_uuid = record.get("first_uuid") or record.get("blocked_uuid")
-
-    # Unblock the device
-    if bound_uuid:
-        await devices_col.update_one(
-            {"uuid": bound_uuid},
-            {"$set": {"isBlocked": False}, "$unset": {"blockReason": "", "blockedAt": ""}}
-        )
-
-    # Reset the IP registry record to clean state
-    await ip_registry_col.update_one(
-        {"ip": ip},
-        {"$set": {
-            "bound_device_blocked": False,
-            "blocked_uuid":         None,
-            "blocked_at":           None,
-            "block_reason":         None,
-            "clone_attempts":       0,
-            "last_clone_uuid":      None,
-            "last_clone_at":        None,
-            "status":               "CLEAN",
-            "last_seen":            datetime.utcnow(),
-        }}
-    )
-    logger.info(f"✅ Admin unblocked IP {ip} (uuid={bound_uuid})")
-    return {"status": "ok", "ip": ip, "unblocked_uuid": bound_uuid}
-
-
-@app.delete("/admin/ip-registry/{ip}")
-async def admin_ip_delete(ip: str, admin: dict = Depends(get_current_admin)):
-    """
-    Hard-delete an IP registry entry.
-    The next registration from that IP will start a completely fresh binding.
-    Does NOT change the device's block status in the devices collection.
-    """
-    ip = urllib.parse.unquote(ip)
-    result = await ip_registry_col.delete_one({"ip": ip})
-    if result.deleted_count == 0:
-        raise HTTPException(404, f"No IP Guard record found for {ip}")
-    logger.info(f"🗑️ Admin deleted IP registry record for {ip}")
-    return {"status": "ok", "ip": ip}
-
 
 @app.get("/admin/schedules")
 async def admin_schedules(admin: dict = Depends(get_current_admin)):
@@ -3445,7 +3904,22 @@ async def admin_manage_user(
     if action == "UPDATE_TRIAL":
         if "seconds" not in payload:
             raise HTTPException(400, "Missing seconds")
-        update["trialRemaining"] = int(payload.get("seconds") or 0)
+        seconds_val = int(payload.get("seconds") or 0)
+        update["trialRemaining"] = seconds_val
+        # Always reset trialUsed when admin manually sets trial time.
+        # Without this, the app gets trial time but the trialUsed=True flag
+        # prevents it from displaying the timer or allowing access correctly.
+        update["trialUsed"] = seconds_val <= 0  # False if giving time, True if zeroing
+        update["trialPausedAt"] = None
+        # Kill all active sessions so the next session/start gets a fresh
+        # trialDeadlineAt stamped from the new trialRemaining value.
+        # Without this, old sessions use their old (or missing) deadline and
+        # expire immediately on the next heartbeat.
+        await sessions_col.update_many(
+            {"uuid": uuid_, "active": True},
+            {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "admin_trial_reset"}}
+        )
+        logger.info(f"🔄 Trial reset for {uuid_}: {seconds_val}s | trialUsed={update['trialUsed']} | old sessions killed")
 
     elif action == "UPGRADE":
         days = payload.get("days")
@@ -3481,13 +3955,37 @@ async def admin_manage_user(
         update["isPremium"] = False
         update["premiumUntil"] = None
         update["currentPackage"] = None
+        # Reset trial so the downgraded user gets a fresh trial window.
+        # Also kill active sessions so the app re-authenticates cleanly.
+        flags_for_downgrade = await get_admin_flags()
+        trial_secs = int(flags_for_downgrade.get("trialSeconds", 300) or 300)
+        update["trialRemaining"] = trial_secs
+        update["trialUsed"] = False
+        update["trialPausedAt"] = None
+        update["lastChannelId"] = None
+        update["downgradedAt"] = datetime.utcnow()
+        await sessions_col.update_many(
+            {"uuid": uuid_, "active": True},
+            {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "admin_downgrade"}}
+        )
+        logger.info(f"⬇️ Downgrade for {uuid_}: trial reset to {trial_secs}s, sessions killed")
 
     elif action in ("BLOCK", "UNBLOCK"):
         update["isBlocked"] = True if action == "BLOCK" else False
 
     # Also support direct field updates
     if "trialRemaining" in payload:
-        update["trialRemaining"] = int(payload["trialRemaining"])
+        secs = int(payload["trialRemaining"])
+        update["trialRemaining"] = secs
+        # Reset trialUsed consistent with UPDATE_TRIAL behaviour
+        if "trialUsed" not in update:
+            update["trialUsed"] = secs <= 0
+            update["trialPausedAt"] = None
+        if action not in ("UPDATE_TRIAL",):  # avoid double-killing sessions
+            await sessions_col.update_many(
+                {"uuid": uuid_, "active": True},
+                {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "admin_trial_direct"}}
+            )
 
     if "isPremium" in payload:
         update["isPremium"] = bool(payload["isPremium"])
@@ -3534,8 +4032,10 @@ async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
 async def session_heartbeat(payload: dict):
     token = payload.get("token")
     uuid_ = payload.get("uuid")
-    seconds = payload.get("seconds", 30)
-    
+    # `seconds` from app is IGNORED for trial (server owns the clock).
+    # Clamped here to prevent any accidental future use.
+    _app_seconds = max(0, min(int(payload.get("seconds", 30) or 30), 300))
+
     if not token or not uuid_:
         raise HTTPException(400, "Token and UUID required")
     
@@ -3553,6 +4053,12 @@ async def session_heartbeat(payload: dict):
     device = await devices_col.find_one({"uuid": uuid_})
     if not device:
         raise HTTPException(404, "Device not found")
+    if _device_blocked(device):
+        await sessions_col.update_one(
+            {"token": token},
+            {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "device_blocked"}}
+        )
+        _assert_device_not_blocked(device, "Device blocked. Contact support.")
     
     # ============================================================================
     # 🔥 CRITICAL FIX: Proper Premium User Handling with Type Safety
@@ -3659,35 +4165,67 @@ async def session_heartbeat(payload: dict):
     if is_watching_premium:
         trial_remaining = device.get("trialRemaining", 0)
         trial_used = device.get("trialUsed", False)
-        
+
         logger.info(f"⏱️ Free user {uuid_} on premium channel | trial_used={trial_used} | trial_remaining={trial_remaining}s")
-        
+
         if trial_used and trial_remaining <= 0:
             logger.warning(f"❌ PAYWALL: Trial exhausted for {uuid_}")
+            await sessions_col.update_one(
+                {"_id": session["_id"]},
+                {"$set": {"active": False, "expiredAt": datetime.utcnow()}}
+            )
             return {
                 "success": False,
                 "action": "EXPIRED",
+                "isPremium": False,
                 "trialRemaining": 0,
                 "message": "Trial expired. Please upgrade to Premium."
             }
 
-        new_trial = max(0, trial_remaining - seconds)
-        
+        # ── SERVER-SIDE CLOCK ────────────────────────────────────────────────
+        # The app sends `seconds` elapsed — we IGNORE it completely.
+        # We use the deadline we stamped on the session at /session/start.
+        # A cloner sending seconds=0 or seconds=-99999 has zero effect.
+        # ────────────────────────────────────────────────────────────────────
+        now_hb = datetime.utcnow()
+        trial_deadline = session.get("trialDeadlineAt")
+
+        if trial_deadline and isinstance(trial_deadline, datetime):
+            new_trial = max(0, int((trial_deadline - now_hb).total_seconds()))
+        else:
+            # Fallback for legacy sessions without a deadline:
+            # tick down by a fixed 30s server-side — app cannot influence this.
+            new_trial = max(0, trial_remaining - 30)
+
         await devices_col.update_one(
             {"uuid": uuid_},
-            {"$set": {
-                "trialRemaining": new_trial,
-                "trialPausedAt": datetime.utcnow()
-            }}
+            {"$set": {"trialRemaining": new_trial, "trialPausedAt": now_hb}}
         )
-        
-        logger.info(f"⏱️ Trial countdown: {trial_remaining}s → {new_trial}s for {uuid_}")
-        
+        logger.info(f"⏱️ Server-clock trial: {trial_remaining}s → {new_trial}s for {uuid_}")
+
+        if new_trial <= 0:
+            await devices_col.update_one(
+                {"uuid": uuid_},
+                {"$set": {"trialRemaining": 0, "trialUsed": True}}
+            )
+            await sessions_col.update_one(
+                {"_id": session["_id"]},
+                {"$set": {"active": False, "expiredAt": now_hb}}
+            )
+            logger.warning(f"❌ Server-side trial deadline hit for {uuid_}")
+            return {
+                "success": False,
+                "action": "EXPIRED",
+                "isPremium": False,
+                "trialRemaining": 0,
+                "message": "Trial expired. Please upgrade to Premium."
+            }
+
         return {
-            "success": True if new_trial > 0 else False,
-            "action": "EXPIRED" if new_trial <= 0 else "CONTINUE",
+            "success": True,
+            "action": "CONTINUE",
             "trialRemaining": new_trial,
-            "message": "Trial expired." if new_trial <= 0 else None
+            "message": None
         }
     else:
         # Watching free channel
@@ -3695,6 +4233,7 @@ async def session_heartbeat(payload: dict):
         return {
             "success": True,
             "action": "CONTINUE",
+            "isPremium": False,
             "trialRemaining": device.get("trialRemaining", 0)
         }
 
@@ -4138,6 +4677,28 @@ async def manual_upgrade_trigger(order_id: str):
 # ╚══════════════════════════════════════════════════════════════════════════╝
 
 # ── ZenoPay Webhook ──────────────────────────────────────────────────────────
+# ── PayWay aliases — app uses /payway/* branding ──────────────────────────
+@app.post("/payway/start")
+async def payway_start(payload: dict = Body(...)):
+    """Alias for /payment/start — same logic, PayWay-branded endpoint."""
+    return await start_payment(payload)
+
+@app.get("/payway/status/{order_id}")
+async def payway_status(order_id: str):
+    """Alias for /payment/status — same logic, PayWay-branded endpoint."""
+    return await payment_status(order_id)
+
+@app.post("/payway/webhooks/zeno")
+async def payway_zeno_webhook(request: Request):
+    """PayWay-branded Zeno webhook alias."""
+    return await zenopay_webhook(request)
+
+@app.post("/payway/webhooks/sonic")
+async def payway_sonic_webhook(request: Request):
+    """PayWay-branded Sonic webhook alias."""
+    return await sonic_webhook(request)
+
+
 @app.post("/webhooks/zeno")
 @app.post("/payment-webhook")    # backward compatibility
 async def zenopay_webhook(request: Request):
