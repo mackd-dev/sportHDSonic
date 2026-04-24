@@ -15,177 +15,18 @@ import base64
 import binascii
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
-from urllib.parse import urljoin, quote, unquote, urlparse
-
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
-
-HET140_PRESET = {
-    "user_agent": DEFAULT_UA,
-    "referer": "https://het140c.ycn-redirect.com/",
-    "origin":  "https://het140c.ycn-redirect.com",
-}
-
-def _host(u: str) -> str:
-    try:
-        return urlparse(u).netloc.lower()
-    except Exception:
-        return ""
-
-def invalid_origin(o: str | None) -> bool:
-    if not o:
-        return True
-    lo = o.lower()
-    return lo.startswith("application/") or "mpegurl" in lo or lo.startswith("video/") or lo.startswith("audio/")
-
-def is_ycn_provider(stream_url: str) -> bool:
-    if not stream_url:
-        return False
-    h = _host(stream_url)
-    # Strict exclusion for lipopo.live to avoid breaking existing logic
-    if "lipopo.live" in h or "lipopotv.live" in h:
-        return False
-    # Only apply to the ycn-redirect.com family
-    return h.endswith("ycn-redirect.com") or ".ycn-redirect.com" in h
-
-def _normalize_alias(a: str) -> str:
-    a = (a or "").strip().lower()
-    return a
-
-def _looks_like_alias(value: str) -> bool:
-    """True when value looks like 'paka.nyama' (not a URL)."""
-    if not value:
-        return False
-    v = value.strip()
-    # If it's a URL, it's not an alias
-    if urlparse(v).scheme in ("http", "https"):
-        return False
-    # If it's a normal stream-looking string, ignore
-    if v.endswith(".mpd") or v.endswith(".m3u8") or v.endswith(".php") or ".php?" in v:
-        return False
-    return "." in v  # paka.nyama
-
-async def resolve_alias_to_stream(db, alias: str):
-    """
-    alias -> channel_aliases -> channelId -> channels_streams -> streamUrl
-
-    If the stored URL is expired or missing, triggers an on-demand scrape
-    for that specific channel before returning, so the player always gets
-    a fresh URL regardless of whether the background scheduler ran.
-    """
-    alias = _normalize_alias(alias)
-    if not alias:
-        return None
-
-    # must match what's stored in DB (e.g. paka.nyama)
-    alias_doc = await db.channel_aliases.find_one({"alias": alias})
-    if not alias_doc:
-        return None
-    if alias_doc.get("isActive") in (0, False):
-        return None
-
-    channel_id = alias_doc.get("channelId")
-    if channel_id is None:
-        return None
-
-    stream_doc = await db.channels_streams.find_one({"channelId": int(channel_id)})
-
-    # ✅ Check if URL is expired or missing — trigger on-demand scrape if so
-    needs_refresh = False
-    if not stream_doc:
-        logger.warning(f"⚠️ No stream doc found for channelId={channel_id} (alias={alias}), triggering on-demand scrape...")
-        needs_refresh = True
-    else:
-        url_expires_at = stream_doc.get("urlExpiresAt")
-        stream_url = stream_doc.get("streamUrl")
-        if not stream_url:
-            logger.warning(f"⚠️ Empty streamUrl for channelId={channel_id} (alias={alias}), triggering on-demand scrape...")
-            needs_refresh = True
-        elif url_expires_at and url_expires_at <= datetime.utcnow():
-            logger.warning(
-                f"⚠️ Stream URL expired for channelId={channel_id} (alias={alias}) "
-                f"at {url_expires_at.isoformat()} — triggering on-demand scrape..."
-            )
-            needs_refresh = True
-
-    if needs_refresh:
-        try:
-            from channel_scraper import ChannelScraper
-        except ImportError:
-            from .channel_scraper import ChannelScraper
-
-        scraper = ChannelScraper(db)
-
-        # Step 1: Scrape ONLY the requested channel immediately so this user
-        # gets a fresh URL without waiting for all 100 channels to complete.
-        fresh = await scraper.scrape_single_channel(int(channel_id))
-        if fresh:
-            stream_doc = fresh
-            logger.info(f"✅ On-demand scrape succeeded for channelId={channel_id} (alias={alias})")
-        else:
-            logger.error(f"❌ On-demand scrape failed for channelId={channel_id} (alias={alias}) — serving stale data if available")
-            # If we have stale data, use it as last resort rather than failing
-            if not stream_doc:
-                return None
-
-        # Step 2: Fire-and-forget full scrape of ALL channels in the background.
-        # This means all other expired channels get refreshed silently without
-        # making this user wait. Any user who clicks another channel after this
-        # completes (~1-8 mins) will get a fresh URL too.
-        async def _background_full_scrape():
-            logger.info(f"\U0001f504 Background full scrape triggered by expired alias \'{alias}\' (channelId={channel_id})")
-            try:
-                result = await scraper.scrape_channels()
-                logger.info(
-                    f"\u2705 Background full scrape complete: "
-                    f"{result['channels_found']} found, "
-                    f"{result['channels_updated']} updated, "
-                    f"{result['channels_failed']} failed"
-                )
-            except Exception as e:
-                logger.error(f"\u274c Background full scrape crashed: {e}")
-
-        asyncio.create_task(_background_full_scrape())
-
-    stream_url = stream_doc.get("streamUrl")
-    if not stream_url:
-        return None
-
-    # ✅ Fetch DRM data from the scraper doc so the app can decrypt it
-    return {
-        "channelId": int(channel_id),
-        "channelName": stream_doc.get("name"),
-        "streamUrl": stream_url,
-        "urlExpiresAt": stream_doc.get("urlExpiresAt"),
-        "status": stream_doc.get("status"),
-        "licenseUrl": stream_doc.get("licenseUrl") or stream_doc.get("license_url"),
-        "drmType": stream_doc.get("drmType") or stream_doc.get("drm_type"),
-        "headers": stream_doc.get("headers")
-    }
 
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 
 from fastapi import FastAPI, Header, HTTPException, Body, Request, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse, JSONResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 from enum import Enum
-
-# -------------------------------------------------
-# Channel Link Manager (scraper + aliases)
-# -------------------------------------------------
-try:
-    # If running as a script with PYTHONPATH including this folder
-    from channel_scheduler import ChannelScheduler
-    from channel_routes import setup_channel_routes
-except Exception:  # pragma: no cover
-    # If running as a package: uvicorn app.main:app
-    from .channel_scheduler import ChannelScheduler
-    from .channel_routes import setup_channel_routes
-
 
 # -------------------------------------------------
 # Logging
@@ -197,9 +38,6 @@ logging.basicConfig(
 
 logger = logging.getLogger("stream-debug")
 
-# Suppress noisy httpx logs
-logging.getLogger("httpx").setLevel(logging.WARNING)
-
 # -------------------------------------------------
 # Configuration & Constants
 # -------------------------------------------------
@@ -207,7 +45,7 @@ MONGODB_URL = os.getenv("MONGODB_URL")
 if not MONGODB_URL:
     raise RuntimeError("❌ MONGODB_URL environment variable is not set")
 
-DATABASE_NAME = "sports_hd"
+DATABASE_NAME = os.getenv("DATABASE_NAME", "sports_hd")
 
 # 🔐 JWT / Auth config (FIXED)
 SECRET_KEY = os.getenv("SECRET_KEY")
@@ -226,20 +64,59 @@ pwd_context = CryptContext(
 # -------------------------------------------------
 # Security
 # -------------------------------------------------
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
-# ✅ SONICPESA CONFIGURATION
-SONICPESA_API_KEY = os.getenv("SONICPESA_API_KEY")  # X-API-KEY header
-SONICPESA_WEBHOOK_URL = os.getenv("SONICPESA_WEBHOOK_URL")  # Optional override if Sonic supports per-request webhooks
-SONICPESA_SECRET_KEY = os.getenv("SONICPESA_SECRET_KEY")  # For X-SonicPesa-Signature verification
-SONICPESA_BASE_URL = os.getenv("SONICPESA_BASE_URL", "https://api.sonicpesa.com/api/v1")
+# ✅ ZENO CONFIGURATION (FIXED)
+ZENO_API_KEY = os.getenv("ZENO_API_KEY")  # x-api-key header
+ZENO_WEBHOOK_URL = os.getenv("ZENO_WEBHOOK_URL")  # Your webhook endpoint URL
+ZENO_SECRET_KEY = os.getenv("ZENO_SECRET_KEY")  # For signature verification (if enabled)
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
+ADMIN_PASSWORD_HASH = os.getenv("ADMIN_PASSWORD_HASH")
+ADMIN_TOKEN_EXPIRE_HOURS = int(os.getenv("ADMIN_TOKEN_EXPIRE_HOURS", "12"))
+CORS_ALLOW_ORIGINS = [item.strip() for item in os.getenv("CORS_ALLOW_ORIGINS", "").split(",") if item.strip()]
+APP_PACKAGE_NAME = os.getenv("APP_PACKAGE_NAME", "").strip()
+ALLOWED_APP_SIGNATURES = {
+    item.strip().lower().replace(":", "")
+    for item in os.getenv("ALLOWED_APP_SIGNATURES", "").split(",")
+    if item.strip()
+}
 
 # ✅ ASPORTSHD BYPASS CODE
 ASPORTSHD_BYPASS_CODE = "491YWB317"
 EXO_OR_BROWSER_UA = "ReactNativeVideo/3.0 (Linux;Android 11) ExoPlayerLib/2.10.4"
+
+
+def normalize_signature(value: Optional[str]) -> str:
+    return (value or "").strip().lower().replace(":", "")
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def verify_admin_password(raw_password: str) -> bool:
+    if ADMIN_PASSWORD_HASH:
+        try:
+            return pwd_context.verify(raw_password, ADMIN_PASSWORD_HASH)
+        except Exception:
+            return False
+    return bool(ADMIN_PASSWORD and secrets.compare_digest(raw_password, ADMIN_PASSWORD))
+
+
+def enforce_client_integrity(request: Request) -> None:
+    package_name = request.headers.get("X-App-Package", "").strip()
+    app_signature = normalize_signature(request.headers.get("X-App-Signature"))
+
+    if APP_PACKAGE_NAME and package_name != APP_PACKAGE_NAME:
+        raise HTTPException(403, "Untrusted client package")
+
+    if ALLOWED_APP_SIGNATURES and app_signature not in ALLOWED_APP_SIGNATURES:
+        raise HTTPException(403, "Untrusted app signature")
 
 # -------------------------------------------------
 # 🔑 Hardcoded ClearKeys for PHP Channels
@@ -259,28 +136,6 @@ PHP_CHANNELS_CLEARKEYS = {
     "CrownTv.mpd": "d861e2b92c744fbba861fb8b1906cf74:977897864cf6d102c85816edb8e403a8",
     "WasafiTV.mpd": "8714fe102679348e9c76cfd315dacaa0:a8b86ceda831061c13c7c4c67bd77f8e",
     "UTV.mpd": "31b8fc6289fe3ca698588a59d845160c:f8c4e73f419cb80db3bdf4a974e31894",
-}
-
-# 🔑 Mapping of channelId to ClearKey license URLs
-CLEARKEY_BY_CHANNEL_ID = {
-    1: "c31df1600afc33799ecac543331803f2:dd2101530e222f545997d4c553787f85",  # Azam Sport1 HD
-    2: "739e7499125b31cc9948da8057b84cf9:1b7d44d798c351acc02f33ddfbb7682a",  # Azam Sport2 HD
-    3: "2f12d7b889de381a9fb5326ca3aa166d:51c2d733a54306fdf89acd4c9d4f6005",  # Azam Sport3 HD
-    4: "1606cddebd3c36308ec5072350fb790a:04ece212a9201531afdd91c6f468e0b3",  # Azam Sport4 HD
-    5: "b5cbe1bb5acf3c7f9995be428245cfcd:89f1188a11e5e000d4443eb27ca378e1",  # Azam One
-    6: "3b92b644635f3bad9f7d09ded676ec47:d012a9d5834f69be1313d4864d150a5f",  # Azam Two
-    7: "d628ae37a8f0336b970f250d9699461e:1194c3d60bb494aabe9114ca46c2738e",  # SinemaZetu
-    8: "8714fe102679348e9c76cfd315dacaa0:a8b86ceda831061c13c7c4c67bd77f8e",  # Wasafi TV
-    9: "e3eb6e0656ec3c22aa308aaa3f82c565:a7634d6defd2c255135095c45bc442fb",  # Crown Tv
-    10: "4dce7643f03c3327832b657d74056b6b:8b8675b9d2ff24dd7c7619d86a698231",  # ChekaPlus TV
-    21: "69646b755f3130303030303030303030:e4a2359b05563399f1d9adfce641724a",  # Kix Movies 
-    23: "2d60429f7d043a638beb7349ae25f008:f9b38900f31ce549425df1de2ea28f9d",  # ZBC 2
-    25: "31b8fc6289fe3ca698588a59d845160c:f8c4e73f419cb80db3bdf4a974e31894",  # UTV
-    26: "e91fec140bc5316f919b4dc9c16287d7:79884fad0dbfcdc43d3e33c82a1f1cfa",  # ZBC
-    14: "7995c724a13748ed970840a8ab5bb9b3:67bdaf1e2175b9ff682fcdf0e2354b1e",  # beinsport 3
-    15: "e3ce77324a3d4fa2a913b26cc1976052:17774f82a3b9e33ea7a149596acbb20f",  # mbc 2
-    11: "c2f5309e756638ef95238636a8ae2593:e1251dfc8cdf06f5a2fc2e05ee693120", #zamaradi
-
 }
 
 PREMIUM_PACKAGES = {
@@ -322,12 +177,10 @@ config_col = db.config
 channels_col = db.channels
 categories_col = db.categories
 schedules_col = db.schedules
-vipindi_col = db.vipindi
 reminders_col = db.reminders
+vipindi_col   = db.vipindi          # Featured TV programs/episodes
 banners_col = db.banners
 
-# Channel Link Manager scheduler handle
-channel_scheduler = None  # initialized on startup
 # --- Models ---
 
 class AdminUser(BaseModel):
@@ -339,13 +192,12 @@ class Channel(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     name: str
     category_id: Optional[str] = Field(None, alias="categoryId")
-    alias: Optional[str] = None
-    order: int = 0
+    order: int = 0  # ✅ NEW
 
     logo_url: Optional[str] = ""
-    mpd_url: Optional[str] = None
+    mpd_url: str
     license_url: Optional[str] = None
-    drm_type: str = "WIDEVINE"
+    drm_type: str = "WIDEVINE" # WIDEVINE, CLEARKEY, PLAYREADY, NONE
     is_premium: bool = False
     active: bool = True
     
@@ -406,14 +258,6 @@ class Schedule(BaseModel):
     class Config:
         allow_population_by_field_name = True
 
-class Kipindi(BaseModel):
-    id: Optional[str] = None
-    name: str
-    thumbnailUrl: str
-    channelId: str
-    active: bool = True
-    createdAt: Optional[str] = None
-
 class PaymentUpdate(BaseModel):
     status: str
 
@@ -426,105 +270,6 @@ class StreamSession(BaseModel):
     token: Optional[str] = None
 
 # --- Helpers ---
-
-async def maybe_auto_expire_premium(device: dict) -> dict:
-    """
-    Checks if a device's premium subscription has expired and downgrades it if so.
-    Ensures trialRemaining is reset upon downgrade.
-    """
-    if not device:
-        return device
-
-    is_premium = device.get("isPremium") or device.get("is_premium") or False
-    premium_until = device.get("premiumUntil") or device.get("premium_until")
-    now = datetime.utcnow()
-
-    if is_premium and premium_until and premium_until <= now:
-        logger.info(f"🚫 Premium expired for {device.get('uuid')} - Auto-downgrading")
-        
-        TRIAL_AFTER_DOWNGRADE = 5
-
-        update = {
-            "isPremium": False,
-            "premiumUntil": None,
-            "currentPackage": None,
-            "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-            "trialUsed": False,
-            "trialPausedAt": None,
-            "lastChannelId": None,
-            "downgradedAt": now
-        }
-
-        await devices_col.update_one(
-            {"uuid": device.get("uuid")},
-            {"$set": update}
-        )
-
-        # Update the local device object to reflect changes
-        device.update(update)
-    
-    return device
-
-def _parse_duration_seconds_from_doc(doc: dict) -> int:
-    """
-    Returns duration in SECONDS from either:
-      - durationUnit + durationValue
-      - durationDays / durationMinutes / durationSeconds
-      - duration_days / duration_minutes / duration_seconds
-    """
-    if not doc:
-        return 0
-
-    # New style: durationUnit + durationValue
-    unit = (doc.get("durationUnit") or doc.get("duration_unit") or "").strip().lower()
-    value = doc.get("durationValue") or doc.get("duration_value")
-
-    if unit and value is not None:
-        try:
-            v = int(value)
-            if unit in ("day", "days"):
-                return v * 86400
-            if unit in ("minute", "minutes", "min", "mins"):
-                return v * 60
-            if unit in ("second", "seconds", "sec", "secs"):
-                return v
-        except Exception:
-            pass  # fall back below
-
-    # Legacy style: explicit fields
-    try:
-        days = int(doc.get("durationDays") or doc.get("duration_days") or 0)
-    except Exception:
-        days = 0
-    try:
-        minutes = int(doc.get("durationMinutes") or doc.get("duration_minutes") or 0)
-    except Exception:
-        minutes = 0
-    try:
-        seconds = int(doc.get("durationSeconds") or doc.get("duration_seconds") or 0)
-    except Exception:
-        seconds = 0
-
-    total = days * 86400 + minutes * 60 + seconds
-    return int(total)
-
-
-def _duration_td_from_package_or_payment(package_doc: dict | None, payment_doc: dict | None) -> timedelta:
-    """
-    Source of truth:
-      1) package_doc (from config packages)
-      2) payment_doc (stored fields)
-    Never silently default to 30 days unless EVERYTHING is missing.
-    """
-    sec = _parse_duration_seconds_from_doc(package_doc or {})
-    if sec <= 0:
-        sec = _parse_duration_seconds_from_doc(payment_doc or {})
-
-    # absolute last-resort fallback (keeps server running, but avoids random 30d unless needed)
-    if sec <= 0:
-        sec = 30 * 86400
-
-    return timedelta(seconds=sec)
 
 # 🔧 PATCH 6 – HEX TO BASE64URL HELPER
 def hex_to_base64url(hex_str: str) -> str:
@@ -590,130 +335,7 @@ def build_clearkey_json(license_url: str) -> Dict[str, Any]:
         logger.error(f"Failed to build ClearKey JSON: {e}")
         return {"keys": []}
 
-
-
-CLEARKEY_SYSTEM_ID = "urn:uuid:e2719d58-a985-b3c9-781a-b030af78d30e"
-WIDEVINE_SYSTEM_ID = "urn:uuid:edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
-PLAYREADY_SYSTEM_ID = "urn:uuid:9a04f079-9840-4286-ab92-e65be0885f95"
-
-
-def should_use_clearkey_mpd_proxy(mpd_url: Optional[str], drm_type: Optional[str]) -> bool:
-    if not mpd_url or (drm_type or "").upper() != "CLEARKEY":
-        return False
-    try:
-        parsed = urlparse(mpd_url)
-        host = (parsed.netloc or "").lower()
-        path = (parsed.path or "").lower()
-    except Exception:
-        return False
-    # ✅ Case-insensitive check for Bein channels on SecureSwiftContent
-    is_secureswift = host.endswith("secureswiftcontent.com")
-    is_bein_path = "/content/dash/live/channel(bein" in path.lower()
-    is_mpd = path.endswith("/master.mpd")
-    
-    return is_secureswift and is_bein_path and is_mpd
-
-
-def rewrite_mpd_for_clearkey_android(mpd_xml: str, manifest_base_url: Optional[str] = None, kid_hex: Optional[str] = None) -> str:
-    """Rewrite a multi-DRM DASH MPD so Android/ExoPlayer uses ClearKey reliably.
-
-    This targets manifests like SecureSwiftContent Bein that advertise PlayReady + Widevine
-    but omit cenc:default_KID. ExoPlayer may show tracks (quality/language) yet render black
-    because the DRM session can't map samples to your ClearKey KID.
-
-    Backend-only fix strategy:
-      - Remove WV/PR hints (laurl/pssh/pro + WV/PR ContentProtection)
-      - Ensure ClearKey ContentProtection exists *per AdaptationSet*
-      - Ensure cenc:default_KID exists (we inject it onto BOTH:
-          a) the mp4protection ContentProtection element (most reliable)
-          b) the ClearKey ContentProtection element
-      - Optionally overwrite BaseURL so all segments flow through our proxy
-    """
-    try:
-        import xml.etree.ElementTree as ET
-
-        out = mpd_xml
-
-        # Strip tags that can mislead the player toward other DRMs
-        out = re.sub(r'<ms:laurl[^>]*>.*?</ms:laurl>', '', out, flags=re.DOTALL | re.IGNORECASE)
-        out = re.sub(r'<(?:cenc:)?pssh[^>]*>.*?</(?:cenc:)?pssh>', '', out, flags=re.DOTALL | re.IGNORECASE)
-        out = re.sub(r'<mspr:pro[^>]*>.*?</mspr:pro>', '', out, flags=re.DOTALL | re.IGNORECASE)
-        out = re.sub(r'\s+dashif:laurl="[^"]*"', '', out, flags=re.IGNORECASE)
-        out = re.sub(r'\s+licenseServerUrl="[^"]*"', '', out, flags=re.IGNORECASE)
-
-        ns = {
-            'mpd': 'urn:mpeg:dash:schema:mpd:2011',
-            'cenc': 'urn:mpeg:cenc:2013',
-        }
-
-        # Preserve familiar DASH namespace formatting (avoid ns0 prefixes)
-        ET.register_namespace('', ns['mpd'])
-        ET.register_namespace('cenc', ns['cenc'])
-
-
-        root = ET.fromstring(out)
-
-        # Normalize KID to UUID-with-dashes
-        kid_uuid = None
-        if kid_hex:
-            k = (kid_hex or '').strip().replace('-', '').lower()
-            if len(k) == 32 and all(c in '0123456789abcdef' for c in k):
-                kid_uuid = f"{k[:8]}-{k[8:12]}-{k[12:16]}-{k[16:20]}-{k[20:]}"
-
-        # Overwrite BaseURL for proxy routing
-        if manifest_base_url:
-            safe_base = manifest_base_url.rstrip('/') + '/'
-            for b in list(root.findall('mpd:BaseURL', ns)):
-                root.remove(b)
-            base_el = ET.Element(f"{{{ns['mpd']}}}BaseURL")
-            base_el.text = safe_base
-            root.insert(0, base_el)
-            # logger.info(f"Injected MPD BaseURL for proxying: {safe_base}")
-
-        def _scheme(el):
-            return (el.attrib.get('schemeIdUri') or '').strip().lower()
-
-        for aset in root.findall('.//mpd:AdaptationSet', ns):
-            cps = list(aset.findall('mpd:ContentProtection', ns))
-
-            # Remove PlayReady/Widevine ContentProtection
-            for cp in list(cps):
-                scheme = _scheme(cp)
-                if scheme in (WIDEVINE_SYSTEM_ID.lower(), PLAYREADY_SYSTEM_ID.lower()):
-                    aset.remove(cp)
-
-            cps = list(aset.findall('mpd:ContentProtection', ns))
-            mp4prot = None
-            for cp in cps:
-                if _scheme(cp) == 'urn:mpeg:dash:mp4protection:2011':
-                    mp4prot = cp
-                    break
-
-            has_ck = any(_scheme(cp) == CLEARKEY_SYSTEM_ID.lower() for cp in cps)
-
-            # Inject default_KID on mp4protection (best compatibility)
-            if mp4prot is not None and kid_uuid:
-                mp4prot.set(f"{{{ns['cenc']}}}default_KID", kid_uuid)
-
-            # Ensure ClearKey ContentProtection exists
-            if mp4prot is not None and not has_ck:
-                ck = ET.Element(f"{{{ns['mpd']}}}ContentProtection")
-                ck.set('schemeIdUri', CLEARKEY_SYSTEM_ID)
-                ck.set('value', 'ClearKey 1.0')
-                if kid_uuid:
-                    ck.set(f"{{{ns['cenc']}}}default_KID", kid_uuid)
-
-                # Insert right after mp4protection
-                idx = list(aset).index(mp4prot) + 1
-                aset.insert(idx, ck)
-
-        rewritten = ET.tostring(root, encoding='utf-8', xml_declaration=True).decode('utf-8')
-        # logger.info("Rewrote MPD ContentProtection for Android ClearKey compatibility (per-AdaptationSet + default_KID)")
-        return rewritten
-
-    except Exception as e:
-        logger.error(f"Failed to rewrite MPD for ClearKey Android: {e}")
-        return mpd_xml
+# 🔧 PATCH 1 – FIX serialize_doc() (ADMIN VS APP SAFE)
 def serialize_doc(doc, for_admin: bool = False):
     """
     Serializes MongoDB document for API responses.
@@ -750,10 +372,6 @@ def serialize_doc(doc, for_admin: bool = False):
         # Ensure icon_url is returned as the primary field
         if "logo_url" in doc and doc["logo_url"] and ("icon_url" not in doc or not doc["icon_url"]):
             doc["icon_url"] = doc["logo_url"]
-    
-    # 🔥 LIFESAVER PATCH: Fake the mpd_url for the Android app so it doesn't crash
-    if not doc.get("mpd_url") and not doc.get("mpdUrl"):
-        doc["mpd_url"] = ""
     
     # Channel-specific logic
     if "mpd_url" in doc or "mpdUrl" in doc:
@@ -844,10 +462,6 @@ def normalize_phone(phone: str) -> str:
 
 
 def detect_stream_type(url: str) -> str:
-    # ✅ Add this safety check
-    if not url:
-        return "UNKNOWN"
-             
     url = url.lower()
     if ".mpd" in url:
         return "DASH"
@@ -901,53 +515,46 @@ async def get_admin_flags():
     return serialize_doc(flags, for_admin=True)
 
 async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    token = credentials.credentials
+    if not credentials or not credentials.credentials:
+        raise HTTPException(401, "Missing admin token")
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         if payload.get("role") != "admin":
-            logger.warning(f"❌ Admin Auth Failed: Role mismatch for user {payload.get('sub')}")
             raise HTTPException(403, "Not authorized as admin")
         return payload
     except JWTError as e:
         logger.error(f"❌ Admin Auth Failed: {str(e)}")
         raise HTTPException(401, "Invalid or expired admin token")
 
-# ✅ SONICPESA SIGNATURE VERIFICATION
-def verify_sonicpesa_signature(payload_raw: bytes, signature: str | None) -> bool:
+# ✅ ZENO SIGNATURE VERIFICATION (OPTIONAL - FIXED)
+def verify_zeno_signature(payload: dict, signature: str) -> bool:
     """
-    Verify SonicPesa webhook signature if SONICPESA_SECRET_KEY is configured.
-    Returns True if verification is disabled or the signature matches.
+    Verify Zeno webhook signature if ZENO_SECRET_KEY is configured.
+    Returns True if signature is valid or if signature verification is disabled.
     """
-    if not SONICPESA_SECRET_KEY:
-        logger.warning("⚠️ SONICPESA_SECRET_KEY not set - webhook signature verification disabled")
+    if not ZENO_SECRET_KEY:
+        logger.warning("⚠️ ZENO_SECRET_KEY not set - signature verification disabled")
         return True
-
+    
     if not signature:
-        logger.error("❌ Missing X-SonicPesa-Signature header")
+        logger.error("❌ Missing signature in webhook")
         return False
-
-    expected = hmac.new(SONICPESA_SECRET_KEY.encode(), payload_raw, hashlib.sha256).hexdigest()
-    is_valid = hmac.compare_digest(expected, signature.strip())
+    
+    # Build signature string from payload
+    keys = ["order_id", "payment_status", "reference"]
+    missing = [k for k in keys if k not in payload]
+    if missing:
+        logger.error(f"❌ Missing required fields for signature: {missing}")
+        return False
+    
+    raw = "&".join(f"{k}={payload.get(k, '')}" for k in keys)
+    expected = hmac.new(ZENO_SECRET_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    
+    is_valid = hmac.compare_digest(expected, signature)
     if not is_valid:
-        logger.error(f"❌ SonicPesa signature mismatch. Expected: {expected}, Got: {signature}")
+        logger.error(f"❌ Signature mismatch. Expected: {expected}, Got: {signature}")
+    
     return is_valid
-
-
-def normalize_gateway_payment_status(raw_status: Optional[str]) -> str:
-    value = (raw_status or "").strip().upper()
-    mapping = {
-        "SUCCESS": "COMPLETED",
-        "COMPLETED": "COMPLETED",
-        "PENDING": "PENDING",
-        "INPROGRESS": "PROCESSING",
-        "PROCESSING": "PROCESSING",
-        "CANCELLED": "CANCELLED",
-        "USERCANCELLED": "CANCELLED",
-        "REJECTED": "FAILED",
-        "FAILED": "FAILED",
-        "ERROR": "FAILED",
-    }
-    return mapping.get(value, value or "PENDING")
 
 def extract_channel_id_from_url(url: str) -> Optional[str]:
     """Extract channel ID from player.php?c=X URL"""
@@ -1152,13 +759,21 @@ app = FastAPI(title="PixTvMax Production API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS or ["*"],
     allow_headers=["*"],
-    allow_methods=["*"]
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_credentials=bool(CORS_ALLOW_ORIGINS)
 )
 
-# 🆕 Channel Link Manager routes
-setup_channel_routes(app, db, get_current_admin)
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith(("/admin", "/session", "/payment", "/api/relay", "/drm")):
+        response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 # ✅ Background Task Function
@@ -1168,11 +783,6 @@ async def subscription_cleanup_task():
         try:
             logger.info("⏰ Running hourly subscription cleanup...")
             now = datetime.utcnow()
-
-            # ✅ pull trialSeconds from config (defaults to 5)
-            flags = await get_admin_flags()
-            trial_seconds = int(flags.get("trialSeconds", 5) or 5)
-
             result = await devices_col.update_many(
                 {
                     "isPremium": True, 
@@ -1181,11 +791,9 @@ async def subscription_cleanup_task():
                 {"$set": {
                     "isPremium": False, 
                     "premiumUntil": None,
-                    "currentPackage": None,
-                    "trialRemaining": trial_seconds,
-                    "trialPausedAt": None,
-                    "lastChannelId": None,
-                    "downgradedAt": now
+                    "downgradedAt": now,
+                    "trialRemaining": 0,
+                    "trialUsed": True
                 }}
             )
             if result.modified_count > 0:
@@ -1198,51 +806,25 @@ async def subscription_cleanup_task():
 
 @app.on_event("startup")
 async def startup():
-    global channel_scheduler
-    # 🟡 Existing indexes
     await payments_col.create_index("order_id")
+    await payments_col.create_index("orderId")
     await payments_col.create_index("status")
     await devices_col.create_index("uuid", unique=True)
-    
-    # ✅ SONICPESA STARTUP VALIDATION
-    if not SONICPESA_API_KEY:
-        logger.error("❌ SONICPESA_API_KEY not set!")
-    if not SONICPESA_SECRET_KEY:
-        logger.warning("⚠️ SONICPESA_SECRET_KEY not set - webhook verification disabled")
-    if not SONICPESA_WEBHOOK_URL:
-        logger.warning("⚠️ SONICPESA_WEBHOOK_URL not set - configure webhook URL in SonicPesa dashboard")
+    await sessions_col.create_index("token", unique=True)
+    await sessions_col.create_index("expiresAt", expireAfterSeconds=0)
+
+    if not ZENO_API_KEY:
+        logger.error("❌ ZENO_API_KEY not set!")
+    if not ZENO_WEBHOOK_URL:
+        logger.warning("⚠️ ZENO_WEBHOOK_URL not set")
     else:
-        logger.info(f"✅ SonicPesa webhook URL configured: {SONICPESA_WEBHOOK_URL}")
+        logger.info(f"✅ Zeno webhook URL configured: {ZENO_WEBHOOK_URL}")
 
-    # ✅ START THE BACKGROUND TASK
     asyncio.create_task(subscription_cleanup_task())
-
-    # 🆕 Channel Link Manager startup (scrape + refresh loop)
-    # Interval is 4 hours — scraper marks URLs fresh for 5 hours, so this
-    # ensures we always refresh before the DB record expires.
-    try:
-        channel_scheduler = ChannelScheduler(db, interval_hours=4)
-        await channel_scheduler.start()
-        logger.info("✅ Channel Link Manager scheduler started (4-hour interval)")
-    except Exception as e:
-        logger.error(f"❌ Failed to start Channel Link Manager: {e}")
-
-
-
-@app.on_event("shutdown")
-async def shutdown():
-    global channel_scheduler
-
-    if channel_scheduler:
-        try:
-            await channel_scheduler.stop()
-            logger.info("✅ Channel Link Manager scheduler stopped")
-        except Exception as e:
-            logger.error(f"❌ Failed to stop Channel Link Manager: {e}")
 
 @app.get("/")
 async def root():
-    return {"status": "OK", "service": "PixTb Max"}
+    return {"status": "OK", "service": "KamweMax"}
 
 @app.get("/config")
 async def get_config():
@@ -1296,8 +878,9 @@ async def get_packages():
 
 @app.get("/content/discovery")
 async def get_discovery():
-    categories = await categories_col.find().sort("order", 1).to_list(None)
-    channels = await channels_col.find({"active": True}).sort("order", 1).to_list(None)
+    categories = await categories_col.find().sort("order", 1).to_list(1000)
+    # ✅ SORTED BY ORDER THEN NAME
+    channels = await channels_col.find({"active": True}).sort([("order", 1), ("name", 1)]).to_list(1000)
     
     return {
         "categories": [serialize_doc(c) for c in categories],
@@ -1342,53 +925,6 @@ async def delete_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
     return {"status": "success"}
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VIPINDI (TV Programs / Shows) ENDPOINTS
-# ─────────────────────────────────────────────────────────────────────────────
-
-@app.get("/api/vipindi")
-@app.get("/vipindi")
-async def get_vipindi():
-    """Get all active vipindi for home screen ticker"""
-    cursor = vipindi_col.find({"active": True})
-    docs = await cursor.to_list(length=200)
-    return [serialize_doc(doc) for doc in docs]
-
-@app.get("/admin/vipindi")
-async def admin_get_vipindi(admin: dict = Depends(get_current_admin)):
-    """Admin: Get all vipindi (including inactive)"""
-    cursor = vipindi_col.find({})
-    docs = await cursor.to_list(length=200)
-    return [serialize_doc(doc) for doc in docs]
-
-@app.post("/api/vipindi")
-@app.post("/admin/vipindi")
-async def create_or_update_kipindi(
-    kipindi: Kipindi,
-    admin: dict = Depends(get_current_admin)
-):
-    kipindi_dict = kipindi.dict()
-    kipindi_id = kipindi_dict.get("id") or str(uuid.uuid4())
-    kipindi_dict["id"] = kipindi_id
-    kipindi_dict["createdAt"] = datetime.utcnow().isoformat()
-    await vipindi_col.update_one(
-        {"id": kipindi_id},
-        {"$set": kipindi_dict},
-        upsert=True
-    )
-    return {"status": "success", "id": kipindi_id}
-
-@app.delete("/api/vipindi/{kipindi_id}")
-@app.delete("/admin/vipindi/{kipindi_id}")
-async def delete_kipindi(
-    kipindi_id: str,
-    admin: dict = Depends(get_current_admin)
-):
-    result = await vipindi_col.delete_one({"id": kipindi_id})
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Kipindi not found")
-    return {"status": "success"}
-
 @app.post("/schedules/remind")
 async def add_reminder(payload: dict = Body(...)):
     """Handle bell notification clicks by registering device interest"""
@@ -1414,28 +950,55 @@ async def add_reminder(payload: dict = Body(...)):
         raise HTTPException(500, "Could not set reminder")
 
 @app.post("/device/register")
-async def register_device(payload: dict):
-    uuid_ = payload.get("uuid")
-    if not uuid_: raise HTTPException(400, "UUID required")
-    
+async def register_device(payload: dict, request: Request):
+    enforce_client_integrity(request)
+    # ── PATCH: Accept blank/missing uuid gracefully.
+    # Android DataStore can race inside runBlocking on first launch and send uuid="".
+    # Auto-generate one so the device still gets registered instead of 400ing.
+    uuid_ = (payload.get("uuid") or request.headers.get("X-DEVICE-ID") or "").strip()
+    if not uuid_:
+        uuid_ = str(uuid.uuid4())
+        logger.warning(f"⚠️ register_device: blank uuid received, auto-generated {uuid_}")
+
+    flags  = await get_admin_flags()
+    now    = datetime.utcnow()
     device = await devices_col.find_one({"uuid": uuid_})
+
+    if device and device.get("isBlocked"):
+        raise HTTPException(403, "Device blocked")
+
     if not device:
-        flags = await get_admin_flags()
-        await devices_col.insert_one({
-            "uuid": uuid_,
-            "isPremium": False,
+        device = {
+            "uuid":           uuid_,
+            "isPremium":      False,
             "trialRemaining": flags.get("trialSeconds", 300),
-            "createdAt": datetime.utcnow(),
-            "lastSeen": datetime.utcnow()
-        })
+            "trialUsed":      False,
+            "createdAt":      now,
+            "lastSeen":       now,
+        }
+        await devices_col.insert_one(device)
     else:
-        # Update last seen
         await devices_col.update_one(
             {"uuid": uuid_},
-            {"$set": {"lastSeen": datetime.utcnow()}}
+            {"$set": {"lastSeen": now}}
         )
-    
-    return {"status": "OK"}
+        device["lastSeen"] = now
+
+    # ── Return the full DeviceResponse shape the app expects ─────────────
+    # App declares: data class DeviceResponse(uuid, trialRemaining, isPremium,
+    #               premiumUntil, createdAt, lastSeen)
+    # Previously returned {"status":"OK"} which Retrofit could not deserialize.
+    def _iso(dt):
+        return dt.isoformat() if dt and hasattr(dt, "isoformat") else ""
+
+    return {
+        "uuid":           uuid_,
+        "trialRemaining": int(device.get("trialRemaining", flags.get("trialSeconds", 300))),
+        "isPremium":      bool(device.get("isPremium", False)),
+        "premiumUntil":   _iso(device.get("premiumUntil")),
+        "createdAt":      _iso(device.get("createdAt", now)),
+        "lastSeen":       _iso(device.get("lastSeen", now)),
+    }
 
 @app.get("/device/status/{uuid}")
 async def device_status(uuid: str):
@@ -1443,15 +1006,21 @@ async def device_status(uuid: str):
     if not device:
         raise HTTPException(404, "Device not found")
 
-    # ✅ FIX: Use centralized expiry logic
-    device = await maybe_auto_expire_premium(device)
-
-    # ✅ SAFETY: Explicit type checking for isPremium
-    is_premium_raw = device.get("isPremium") or device.get("is_premium")
-    if isinstance(is_premium_raw, str):
-        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
-    else:
-        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+    # ✅ FIX: This is now unindented so it actually runs!
+    if device.get("isPremium") and device.get("premiumUntil"):
+        # Check if time has passed
+        if device["premiumUntil"] <= datetime.utcnow():
+            logger.info(f"📉 Auto-downgrading expired user: {uuid}")
+            await devices_col.update_one(
+                {"uuid": uuid},
+                {"$set": {
+                    "isPremium": False,
+                    "premiumUntil": None,
+                    "downgradedAt": datetime.utcnow()
+                }}
+            )
+            # Update local variable so the app sees the change immediately
+            device["isPremium"] = False
 
     # If trial is exhausted, ensure it's 0
     trial_remaining = device.get("trialRemaining", 0)
@@ -1459,12 +1028,13 @@ async def device_status(uuid: str):
         trial_remaining = 0
 
     return {
-        "isPremium": is_premium,
+        "isPremium": device.get("isPremium", False),
         "trialRemaining": trial_remaining
     }
 
 @app.get("/entitlement")
-async def get_entitlement(x_device_id: str = Header(None)):
+async def get_entitlement(request: Request, x_device_id: str = Header(None)):
+    enforce_client_integrity(request)
     if not x_device_id:
         raise HTTPException(400, "X-DEVICE-ID header required")
     
@@ -1486,22 +1056,31 @@ async def get_entitlement(x_device_id: str = Header(None)):
         }
         await devices_col.insert_one(device)
     else:
+        if device.get("isBlocked"):
+            raise HTTPException(403, "Device blocked")
         # ✅ NEW: Check if Premium has expired when checking entitlement
-        device = await maybe_auto_expire_premium(device)
-    
-    # ✅ SAFETY: Explicit type checking for isPremium
-    is_premium_raw = device.get("isPremium") or device.get("is_premium")
-    if isinstance(is_premium_raw, str):
-        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
-    else:
-        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+        if device.get("isPremium") and device.get("premiumUntil") and device["premiumUntil"] <= now:
+            logger.info(f"🚫 Premium expired for {x_device_id} (entitlement check)")
+            await devices_col.update_one(
+                {"uuid": x_device_id},
+                {"$set": {
+                    "isPremium": False, 
+                    "premiumUntil": None,
+                    "downgradedAt": now,
+                    "trialRemaining": 0,
+                    "trialUsed": True
+                }}
+            )
+            # Update local object for the response
+            device["isPremium"] = False
+            device["premiumUntil"] = None
     
     # Check if trial was already used (one-time enforcement)
     trial_used = device.get("trialUsed", False)
     trial_remaining = device.get("trialRemaining", 0)
     
     return {
-        "isPremium": is_premium,
+        "isPremium": device.get("isPremium", False),
         "subscriptionExpiresAt": int(device["premiumUntil"].timestamp() * 1000) if device.get("premiumUntil") else None,
         "trialRemainingSeconds": trial_remaining,
         "trialUsed": trial_used,  # Inform app if trial was already used
@@ -1511,9 +1090,10 @@ async def get_entitlement(x_device_id: str = Header(None)):
 
 @app.post("/session/start")
 async def start_session(payload: dict, request: Request):
-    # logger.info("========== /session/start ==========")
-    # logger.info(f"Payload received: {payload}")
-    # logger.info(f"Client IP: {request.client.host if request.client else 'unknown'}")
+    enforce_client_integrity(request)
+    logger.info("========== /session/start ==========")
+    logger.info(f"Payload received: {payload}")
+    logger.info(f"Client IP: {request.client.host if request.client else 'unknown'}")
     
     uuid_ = payload.get("uuid")
     
@@ -1531,19 +1111,35 @@ async def start_session(payload: dict, request: Request):
     device = await devices_col.find_one({"uuid": uuid_})
     if not device:
         raise HTTPException(404, "Device not found")
-
-    # ✅ Ensure /session/start applies auto-expiry BEFORE building the session response
-    device = await maybe_auto_expire_premium(device)
+    if device.get("isBlocked"):
+        raise HTTPException(403, "Device blocked")
 
     flags = await get_admin_flags()
     if flags.get("maintenance"):
         raise HTTPException(503, "Maintenance")
 
     # Trial / Premium check
-    is_premium = device.get("isPremium") or device.get("is_premium") or False
-    premium_until = device.get("premiumUntil") or device.get("premium_until")
+    is_premium = device.get("isPremium", False)
+    premium_until = device.get("premiumUntil")
     trial_remaining = device.get("trialRemaining", 0)
     trial_used = device.get("trialUsed", False)
+
+    # ✅ NEW: Check if Premium has expired BEFORE starting session
+    if is_premium and premium_until and premium_until <= datetime.utcnow():
+        logger.info(f"🚫 Premium expired for {uuid_} at session start")
+        await devices_col.update_one(
+            {"uuid": uuid_},
+            {"$set": {
+                "isPremium": False, 
+                "premiumUntil": None,
+                "downgradedAt": datetime.utcnow(),
+                "trialRemaining": 0,
+                "trialUsed": True
+            }}
+        )
+        is_premium = False
+        # If it was a premium channel, the trial logic below will now handle it
+        # (either allow trial or block if trial is exhausted)
     
     # Generate a fresh token for this session
     token = secrets.token_urlsafe(32)
@@ -1580,54 +1176,21 @@ async def start_session(payload: dict, request: Request):
         logger.error(f"Channel NOT FOUND in database. ID: {channel_id}")
         raise HTTPException(404, "Channel not found")
 
-    # 🔥 PATCH 2: Force ClearKey for known channels from hardcoded list
-    channel_id_int = None
-    try:
-        channel_id_int = int(channel_id) if isinstance(channel_id, str) and channel_id.isdigit() else None
-    except:
-        pass
-
-    if channel_id_int and channel_id_int in CLEARKEY_BY_CHANNEL_ID:
-        if not channel_doc.get("drm_type") or channel_doc.get("drm_type", "").upper() == "NONE":
-            logger.info(f"🔑 Setting ClearKey for channel {channel_id_int} (from hardcoded list)")
-            channel_doc["drm_type"] = "CLEARKEY"
-            channel_doc["license_url"] = CLEARKEY_BY_CHANNEL_ID[channel_id_int]
-
     # Use Pydantic model for validation and access
     channel = Channel(**channel_doc)
 
     # 🔥 TRIAL LOGIC: Only apply trial to PREMIUM channels for non-premium users
-    # Force-sync the user's premium status before checking the paywall
-    
-    # ✅ SAFETY FIX #1: Explicit type checking for isPremium (handle string "true")
-    is_premium_raw = device.get("isPremium") or device.get("is_premium")
-    if isinstance(is_premium_raw, str):
-        user_is_premium = is_premium_raw.lower() in ("true", "1", "yes")
-    else:
-        user_is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
-    
-    premium_until_value = device.get("premiumUntil") or device.get("premium_until")
-    now_check = datetime.utcnow()
-    
-    # ✅ SAFETY FIX #2: Double-check that premium subscription is still active
-    if user_is_premium and premium_until_value:
-        if isinstance(premium_until_value, datetime) and premium_until_value <= now_check:
-            logger.warning(f"Premium expired in /session/start for {uuid_}")
-            user_is_premium = False
-    
-    # ✅ FIX: If user is premium, they should NOT be treated as a trial user
-    # Ensure channelIsPremium is FALSE for premium users so the app doesn't start the timer
-    effective_channel_is_premium = channel.is_premium and not user_is_premium
-
-    if channel.is_premium and not user_is_premium:
+    if not is_premium and channel.is_premium:
         # Check if trial was ALREADY used up completely
         if trial_used and trial_remaining <= 0:
             # Trial is exhausted - BLOCK ACCESS
             logger.warning(f"Trial exhausted for device {uuid_} trying to access premium channel {channel_id}")
-            raise HTTPException(
-                status_code=403,
-                detail="Trial exhausted for premium channels. Please upgrade to Premium to continue watching."
-            )
+            return {
+                "success": False,
+                "action": "EXPIRED",
+                "trialRemaining": 0,
+                "message": "Trial exhausted. Please upgrade to Premium to continue watching."
+            }
         
         # If it's the first time watching a premium channel, mark as used
         if not trial_used:
@@ -1655,74 +1218,12 @@ async def start_session(payload: dict, request: Request):
     # Stream Resolution Logic
     # =====================================================
     
-    stream_type = None
-
-    # ✅ Alias support (preferred)
-    alias_value = (getattr(channel, "alias", None) or "").strip()
-
-    # ✅ Fallback: if someone mistakenly put alias into mpd_url, treat mpd_url as alias
-    if not alias_value and _looks_like_alias(getattr(channel, "mpd_url", "")):
-        alias_value = getattr(channel, "mpd_url", "").strip()
-
-    if alias_value:
-        logger.info(f"🕵️ ALIAS DETECTED: Looking up '{alias_value}' in database...")
-        resolved_alias = await resolve_alias_to_stream(db, alias_value)
-        
-        if not resolved_alias:
-            logger.error(f"❌ ALIAS FAILED: Could not resolve '{alias_value}'")
-            raise HTTPException(status_code=400, detail=f"Alias not resolved: {alias_value}")
-
-        stream_url = resolved_alias["streamUrl"]
-        logger.info(f"✅ ALIAS RESOLVED! Hidden Stream URL: {stream_url}")
-        low = stream_url.lower()
-
-        # override mpd/hls based on resolved url
-        if ".mpd" in low:
-            mpd_url = stream_url
-            hls_url = None
-            stream_type = "DASH"
-        elif ".m3u8" in low:
-            hls_url = stream_url
-            mpd_url = None
-            stream_type = "HLS"
-        else:
-            raise HTTPException(status_code=400, detail=f"Unknown stream type from alias: {stream_url}")
-        
-        # ✅ NEW: Apply the DRM keys from the scraper database directly to the channel
-        if resolved_alias.get("drmType"):
-            channel.drm_type = resolved_alias["drmType"].upper()
-            logger.info(f"🔑 Applied Alias DRM Type: {channel.drm_type}")
-            
-        if resolved_alias.get("licenseUrl"):
-            channel.license_url = resolved_alias["licenseUrl"]
-            logger.info(f"🔑 Applied Alias License Key: {channel.license_url}")
-            
-        if resolved_alias.get("headers"):
-            if not channel.headers:
-                channel.headers = {}
-            channel.headers.update(resolved_alias["headers"])
-
-        # ✅ Fallback: Attach ClearKey statically if defined in CLEARKEY_BY_CHANNEL_ID
-        if "CLEARKEY_BY_CHANNEL_ID" in globals() and stream_type == "DASH":
-            clearkey = CLEARKEY_BY_CHANNEL_ID.get(resolved_alias["channelId"])
-            if clearkey and not channel.license_url:
-                logger.info(f"🔑 Found Static ClearKey for Alias Channel {resolved_alias['channelId']}")
-                channel.drm_type = "CLEARKEY"
-                channel.license_url = clearkey
-        
-        # Update channel object with resolved values for the rest of the handler
-        channel.mpd_url = mpd_url
-    
     # 🔥 PHP handling (detects when admin saves a .php link)
     resolved = None
     mpd_url = channel.mpd_url
 
-    # ✅ Catch unfinished channels before they crash the player
-    if not mpd_url and not alias_value:
-        raise HTTPException(status_code=400, detail="This channel is under construction (no stream configured yet).")
-
-    # ✅ Add 'mpd_url and' to prevent NoneType errors
-    if mpd_url and (mpd_url.endswith(".php") or ".php?" in mpd_url):
+    # 🔥 PHP & AUTO-CLEARKEY HANDLING
+    if mpd_url.endswith(".php") or ".php?" in mpd_url:
         logger.info("🧩 PHP URL detected, attempting resolution")
         
         # 1. Resolve the stream to get fresh token
@@ -1755,81 +1256,37 @@ async def start_session(payload: dict, request: Request):
     else:
         stream_type = detect_stream_type(mpd_url)
 
-    # logger.info(f"Detected stream type: {stream_type}")
+    logger.info(f"Detected stream type: {stream_type}")
 
-    if channel.headers is None:
-        channel.headers = {}
+    session_headers = dict(channel.headers or {})
+    session_headers.setdefault("X-DEVICE-ID", uuid_)
+    if request.headers.get("X-App-Package"):
+        session_headers.setdefault("X-App-Package", request.headers.get("X-App-Package"))
+    if request.headers.get("X-App-Signature"):
+        session_headers.setdefault("X-App-Signature", request.headers.get("X-App-Signature"))
+    if request.headers.get("X-App-Version"):
+        session_headers.setdefault("X-App-Version", request.headers.get("X-App-Version"))
     
-    if channel.user_agent:
-        channel.headers["User-Agent"] = channel.user_agent
-    if channel.referer:
-        channel.headers["Referer"] = channel.referer
-    if channel.origin:
-        channel.headers["Origin"] = channel.origin
-    
-    upstream_mpd_url = mpd_url if stream_type == "DASH" else None
-    use_clearkey_mpd_proxy = False
-    if stream_type == "DASH":
-        # 🔥 PATCH 3: Validate ClearKey format if present
-        if channel.drm_type and channel.drm_type.upper() == "CLEARKEY":
-            license_url = channel.license_url or ""
-            
-            if ":" not in license_url:
-                logger.error(f"❌ ClearKey license_url format invalid: {license_url}")
-                logger.error(f"   Expected format: 'kid:key' (hex values)")
-                raise HTTPException(400, f"Invalid ClearKey format for channel {channel_id}")
-            
-            kid_hex, key_hex = license_url.split(":", 1)
-            
-            # Validate hex values
-            try:
-                int(kid_hex, 16)
-                int(key_hex, 16)
-                # logger.info(f"✅ ClearKey format valid for channel {channel_id}")
-            except ValueError as e:
-                logger.error(f"❌ ClearKey hex values invalid: {e}")
-                raise HTTPException(400, f"Invalid ClearKey hex values for channel {channel_id}")
-        
-        use_clearkey_mpd_proxy = should_use_clearkey_mpd_proxy(upstream_mpd_url, channel.drm_type)
-        # logger.info(
-        #     f"DASH finalization | upstream_mpd={upstream_mpd_url} | drm_type={channel.drm_type} | clearkey_proxy={use_clearkey_mpd_proxy}"
-        # )
-        if use_clearkey_mpd_proxy:
-            base_url = str(request.base_url).rstrip('/')
-            mpd_url = f"{base_url}/api/mpd/clearkey-proxy/{token}"
-            # logger.info(f"🔁 Using Android ClearKey MPD proxy: {mpd_url}")
-
-    await sessions_col.insert_one({
-        "uuid": uuid_,
-        "token": token,
-        "expiresAt": expiry,
-        "active": True,
-        "ip": request.client.host if request.client else "unknown",
-        "createdAt": datetime.utcnow(),
-        "headers": channel.headers,
-        "drm_type": (channel.drm_type or "NONE").lower(),
-        "license_url": channel.license_url,
-        "upstream_mpd": upstream_mpd_url,
-        "resolved_mpd": upstream_mpd_url,
-        "stream_type": stream_type,
-        "player_mode": flags.get("playerMode", "EXO"),
-        "channel_id": channel_id,
-        "clearkey_mpd_proxy": use_clearkey_mpd_proxy,
-    })
-
     if stream_type == "HLS":
-        # ✅ HLS Proxy Integration: Route through proxy if custom headers are present OR if it's a YCN provider
-        # We check is_ycn_provider(mpd_url) to catch cases where admin only pasted the URL
-        if channel.user_agent or channel.referer or channel.origin or is_ycn_provider(mpd_url):
-            # Use absolute URL for the proxy to ensure the player can reach it
-            # request.base_url is safer than hardcoding the domain
-            base_url = str(request.base_url).rstrip('/')
-            proxy_url = f"{base_url}/api/hls/proxy"
-            mpd_url = f"{proxy_url}?url={quote(mpd_url)}"
-            logger.info(f"🔗 HLS Proxying enabled for: {channel.name} (YCN or Custom Headers) | Proxy URL: {mpd_url}")
-
         # ✅ FIXED: Return all required fields with correct names for frontend
+        await sessions_col.insert_one({
+            "uuid": uuid_,
+            "token": token,
+            "expiresAt": expiry,
+            "active": True,
+            "ip": request.client.host if request.client else "unknown",
+            "createdAt": datetime.utcnow(),
+            "headers": session_headers,
+            "stream_type": "hls",
+            "drm_type": "none",
+            "license_url": None,
+            "resolved_mpd": mpd_url,
+            "upstream_mpd": mpd_url,
+            "channelId": channel_id,
+        })
         return {
+            "success": True,
+            "action": "CONTINUE",
             "mpd_url": mpd_url,                       # ✅ Renamed from stream_url
             "stream_type": "HLS",                             # ✅ Keep for reference
             "license_url": None,                              # ✅ Explicitly null for HLS
@@ -1837,44 +1294,49 @@ async def start_session(payload: dict, request: Request):
             "expires_at": int(expiry.timestamp()),            # ✅ Add expiry timestamp
             "player_mode": flags.get("playerMode", "EXO"),   # ✅ Add player mode
             "drm_type": "NONE",
-            "drm_data": None,                                 # 🔥 PATCH 1: Add drm_data for app compatibility
-            "headers": channel.headers,
-            "trialRemaining": 0 if user_is_premium else trial_remaining,                # ✅ Add trial remaining
-            "channelIsPremium": effective_channel_is_premium            # ✅ CRITICAL: Pass channel premium status
+            "headers": session_headers,
+            "trialRemaining": trial_remaining,                # ✅ Add trial remaining
+            "channelIsPremium": channel.is_premium            # ✅ CRITICAL: Pass channel premium status
         }
 
     elif stream_type == "DASH":
-        # 🔥 PATCH 4: Improved DASH response with explicit drm_data handling
-        # logger.info(f"Building DASH response for channel {channel_id}")
-        
-        # ✅ NEW FIX: ExoPlayer needs a REAL URL to fetch the keys. 
-        # If we have a raw kid:key, convert it into an endpoint URL on our server.
-        final_license_url = channel.license_url
-        if channel.drm_type and channel.drm_type.upper() == "CLEARKEY" and channel.license_url and ":" in channel.license_url:
-            kid, key = channel.license_url.split(":")
-            base_url = str(request.base_url).rstrip('/')
-            final_license_url = f"{base_url}/api/clearkey/{kid.strip()}/{key.strip()}"
-            # logger.info(f"🔗 Generated ClearKey Endpoint for Android: {final_license_url}")
-
-        # Build base response
+        # ✅ FIXED: Return all required fields with correct names for frontend
         response = {
-            "mpd_url": mpd_url,                       
-            "stream_type": "DASH",                            
-            "license_url": final_license_url or "",
-            "token": token or "",                            
-            "expires_at": int(expiry.timestamp()),            
-            "player_mode": flags.get("playerMode", "EXO"),   
-            "drm_type": (channel.drm_type or "NONE").upper(),  # Normalize to uppercase
-            "headers": channel.headers or {},  # Never null
-            "trialRemaining": 0 if user_is_premium else trial_remaining,                
-            "channelIsPremium": effective_channel_is_premium  # Never null
+            "success": True,
+            "action": "CONTINUE",
+            "mpd_url": mpd_url,                       # ✅ Renamed from stream_url
+            "stream_type": "DASH",                            # ✅ Keep for reference
+            "license_url": channel.license_url,               # ✅ Add license URL
+            "token": token or "",                            # ✅ Add token (use empty string if None)
+            "expires_at": int(expiry.timestamp()),            # ✅ Add expiry timestamp
+            "player_mode": flags.get("playerMode", "EXO"),   # ✅ Add player mode
+            "drm_type": channel.drm_type,
+            "headers": session_headers,
+            "trialRemaining": trial_remaining,                # ✅ Add trial remaining
+            "channelIsPremium": channel.is_premium            # ✅ CRITICAL: Pass channel premium status
         }
         
-        # 🔥 PATCH 4: For ClearKey, include drm_data (ALWAYS for app compatibility)
+        # ✅ PATCH 8: For ClearKey, convert kid:key format to proper JSON structure
         if channel.drm_type and channel.drm_type.upper() == "CLEARKEY" and channel.license_url:
             response["drm_data"] = build_clearkey_json(channel.license_url)
-        else:
-            response["drm_data"] = None
+            logger.info(f"Built ClearKey JSON: {response['drm_data']}")
+
+        await sessions_col.insert_one({
+            "uuid": uuid_,
+            "token": token,
+            "expiresAt": expiry,
+            "active": True,
+            "ip": request.client.host if request.client else "unknown",
+            "createdAt": datetime.utcnow(),
+            "headers": session_headers,
+            "stream_type": "dash",
+            "drm_type": (channel.drm_type or "NONE").lower(),
+            "license_url": channel.license_url,
+            "resolved_license": channel.license_url,
+            "resolved_mpd": mpd_url,
+            "upstream_mpd": mpd_url,
+            "channelId": channel_id,
+        })
         
         return response
 
@@ -1960,7 +1422,7 @@ async def admin_stats(admin: dict = Depends(get_current_admin)):
 
 @app.get("/admin/users")
 async def admin_users(admin: dict = Depends(get_current_admin)):
-    users = await devices_col.find().sort("createdAt", -1).to_list(None)
+    users = await devices_col.find().sort("createdAt", -1).to_list(1000)
 
     return [
         {
@@ -1983,29 +1445,15 @@ async def admin_users(admin: dict = Depends(get_current_admin)):
 
 # 🔧 PATCH 2 – USE for_admin=True IN ADMIN ENDPOINTS
 @app.get("/api/channels")
-async def admin_channels(admin: dict = Depends(get_current_admin)):
-    channels = await channels_col.find().sort("order", 1).to_list(None)
+async def admin_list_channels(admin: dict = Depends(get_current_admin)):
+    # ✅ SORTED BY ORDER THEN NAME
+    channels = await channels_col.find().sort([("order", 1), ("name", 1)]).to_list(1000)
     return [serialize_doc(c, for_admin=True) for c in channels]
-
-@app.post("/admin/channels/reorder")
-async def admin_reorder_channels(reorder_data: List[Dict[str, Any]] = Body(...), admin: dict = Depends(get_current_admin)):
-    """
-    Persist channel ordering in MongoDB.
-    Body format: [{"id": "...", "order": 0}, ...]
-    """
-    for item in reorder_data:
-        channel_id = item.get("id")
-        new_order = item.get("order")
-        if channel_id is not None and new_order is not None:
-            await channels_col.update_one(
-                {"id": channel_id},
-                {"$set": {"order": int(new_order)}}
-            )
-    return {"status": "success"}
 
 # 🔧 PATCH 3 – BLOCK INVALID WIDEVINE CHANNELS (CRITICAL)
 @app.post("/api/channels")
 async def admin_create_channel(channel: Channel, admin: dict = Depends(get_current_admin)):
+
     # 🔧 PATCH 3 – BLOCK INVALID WIDEVINE CHANNELS (CRITICAL)
     if channel.drm_type == "WIDEVINE":
         has_any_headers = any([
@@ -2028,12 +1476,6 @@ async def admin_create_channel(channel: Channel, admin: dict = Depends(get_curre
     # ✅ FIX 2B: Prevent backend from filling it with junk
     # We explicitly ensure 'token' is None if it's an empty string
     channel_data = channel.dict(by_alias=False)
-    
-    # Normalize category fields for creation
-    if "categoryId" in channel_data and channel_data["categoryId"]:
-        channel_data["category_id"] = channel_data["categoryId"]
-        del channel_data["categoryId"]
-
     if channel_data.get("token") == "":
         channel_data["token"] = None
 
@@ -2047,7 +1489,6 @@ async def admin_create_channel(channel: Channel, admin: dict = Depends(get_curre
 
 @app.put("/api/channels/{channel_id}")
 async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = Depends(get_current_admin)):
-    # Removed strict validation for mpd_url or alias presence
 
     if channel.drm_type == "WIDEVINE":
         has_any_headers = any([
@@ -2107,15 +1548,11 @@ async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = 
 
     # Fields we want to allow updating
     allowed_fields = {
-        "name", "category_id", "logo_url", "mpd_url", "license_url", 
+        "name", "category_id", "order", "logo_url", "mpd_url", "license_url", 
         "drm_type", "is_premium", "active", "is_proxied", 
         "session_based_drm", "drm_robustness", "nv_tenant_id", 
-        "nv_authorizations", "user_agent", "referer", "origin", "token", "headers", "order", "alias"
+        "nv_authorizations", "user_agent", "referer", "origin", "token", "headers"
     }
-
-    # Always prefer category_id over categoryId for DB persistence
-    if "categoryId" in channel_data and channel_data["categoryId"]:
-        channel_data["category_id"] = channel_data["categoryId"]
 
     set_data = {}
     unset_data = {}
@@ -2126,9 +1563,6 @@ async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = 
             unset_data[field] = ""
         else:
             set_data[field] = val
-    
-    # Explicitly unset categoryId to ensure normalization to category_id
-    unset_data["categoryId"] = ""
 
     update_op = {}
     if set_data:
@@ -2138,36 +1572,6 @@ async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = 
 
     if not update_op:
         return {"message": "No changes detected"}
-
-    # ✅ Fix: Either mpd_url or alias must be provided
-    existing = await channels_col.find_one({"id": channel_id})
-    if not existing:
-        raise HTTPException(404, "Channel not found")
-
-    # Determine final mpd_url:
-    # 1. If it's in set_data, use that.
-    # 2. If it's in unset_data, it's being cleared (None).
-    # 3. Otherwise, use existing value.
-    if "mpd_url" in set_data:
-        final_mpd = set_data["mpd_url"]
-    elif "mpd_url" in unset_data:
-        final_mpd = None
-    else:
-        final_mpd = existing.get("mpd_url")
-
-    # Determine final alias:
-    if "alias" in set_data:
-        final_alias = set_data["alias"]
-    elif "alias" in unset_data:
-        final_alias = None
-    else:
-        final_alias = existing.get("alias")
-
-    mpd_str = str(final_mpd or "").strip()
-    alias_str = str(final_alias or "").strip()
-
-    if not mpd_str and not alias_str:
-        raise HTTPException(status_code=400, detail="Either mpd_url or alias must be provided")
 
     result = await channels_col.update_one(
         {"id": channel_id},
@@ -2185,9 +1589,19 @@ async def admin_delete_channel(channel_id: str, admin: dict = Depends(get_curren
     await channels_col.delete_one({"id": channel_id})
     return {"status": "OK"}
 
+@app.post("/admin/channels/reorder")
+async def admin_reorder_channels(order_data: List[Dict[str, Any]], admin: dict = Depends(get_current_admin)):
+    for item in order_data:
+        if "id" in item and "order" in item:
+            await channels_col.update_one(
+                {"id": item["id"]},
+                {"$set": {"order": int(item["order"])}}
+            )
+    return {"status": "OK"}
+
 @app.get("/admin/categories")
 async def admin_categories(admin: dict = Depends(get_current_admin)):
-    categories = await categories_col.find().sort("order", 1).to_list(None)
+    categories = await categories_col.find().sort("order", 1).to_list(1000)
     return [serialize_doc(c, for_admin=True) for c in categories]
 
 @app.post("/admin/categories")
@@ -2221,7 +1635,7 @@ async def admin_reorder_categories(order_data: List[Dict[str, Any]], admin: dict
 
 @app.get("/admin/banners")
 async def admin_banners(admin: dict = Depends(get_current_admin)):
-    banners = await banners_col.find().to_list(None)
+    banners = await banners_col.find().to_list(1000)
     return [serialize_doc(b, for_admin=True) for b in banners]
 
 @app.post("/admin/banners")
@@ -2273,58 +1687,20 @@ async def admin_delete_banner(banner_id: str, admin: dict = Depends(get_current_
         raise HTTPException(status_code=404, detail=f"Banner not found with ID: {banner_id}")
     return {"status": "success"}
 
-from bson import ObjectId
-
 @app.get("/admin/schedules")
 async def admin_schedules(admin: dict = Depends(get_current_admin)):
-    schedules = await schedules_col.find().sort("startTime", 1).to_list(None)
+    schedules = await schedules_col.find().sort("startTime", 1).to_list(1000)
     return [serialize_doc(s, for_admin=True) for s in schedules]
 
 @app.post("/admin/schedules")
 async def admin_create_schedule(schedule: Schedule, admin: dict = Depends(get_current_admin)):
     schedule_dict = schedule.dict()
-
-    # ✅ Ensure we always have a stable "id" (admin panel relies on this)
-    if not schedule_dict.get("id"):
-        schedule_dict["id"] = str(uuid.uuid4())
-
-    # ✅ Upsert so POST can act like "create/update" safely
-    await schedules_col.update_one(
-        {"id": schedule_dict["id"]},
-        {"$set": schedule_dict},
-        upsert=True
-    )
-
-    saved = await schedules_col.find_one({"id": schedule_dict["id"]})
-    return serialize_doc(saved, for_admin=True)
-
-@app.put("/admin/schedules/{schedule_id}")
-async def admin_update_schedule(schedule_id: str, schedule: Schedule, admin: dict = Depends(get_current_admin)):
-    schedule_dict = schedule.dict()
-    schedule_dict["id"] = schedule_id  # force consistency
-
-    # ✅ Upsert prevents “not found” issues if client uses a new UUID
-    await schedules_col.update_one(
-        {"id": schedule_id},
-        {"$set": schedule_dict},
-        upsert=True
-    )
-
-    updated = await schedules_col.find_one({"id": schedule_id})
-    return serialize_doc(updated, for_admin=True)
+    await schedules_col.insert_one(schedule_dict)
+    return serialize_doc(schedule_dict, for_admin=True)
 
 @app.delete("/admin/schedules/{schedule_id}")
 async def admin_delete_schedule(schedule_id: str, admin: dict = Depends(get_current_admin)):
-    # 1) Try delete by your custom "id"
-    res = await schedules_col.delete_one({"id": schedule_id})
-
-    # 2) Fallback: if client passed MongoDB _id
-    if res.deleted_count == 0 and ObjectId.is_valid(schedule_id):
-        res = await schedules_col.delete_one({"_id": ObjectId(schedule_id)})
-
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail=f"Schedule not found: {schedule_id}")
-
+    await schedules_col.delete_one({"id": schedule_id})
     return {"status": "OK"}
 
 @app.get("/admin/config")
@@ -2386,34 +1762,26 @@ async def admin_update_config(config: dict, admin: dict = Depends(get_current_ad
 
 
 @app.post("/admin/login")
-async def admin_login(payload: dict):
-    # 1. Print what we actually received (for debugging)
-    print(f"DEBUG LOGIN PAYLOAD: {payload}") 
-
-    # 2. Check for 'username' OR 'email'
+async def admin_login(payload: dict, request: Request):
     raw_username = payload.get("username") or payload.get("email")
     raw_password = payload.get("password")
 
-    # 3. Safety check: handle empty values
     if not raw_username or not raw_password:
         raise HTTPException(401, "Missing username or password")
 
-    # 4. Strip whitespace (fix "admin " vs "admin")
     username = raw_username.strip()
     password = raw_password.strip()
-    
-    # 5. Compare with Environment Variables
-    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
-        token = jwt.encode({
-            "sub": username,
-            "role": "admin",
-            "exp": datetime.utcnow() + timedelta(days=7)
-        }, SECRET_KEY, algorithm=ALGORITHM)
-        return {"access_token": token, "token_type": "bearer"}
-    
-    # If we get here, credentials didn't match
-    print(f"DEBUG: Login failed. Expected '{ADMIN_USERNAME}', got '{username}'")
-    raise HTTPException(401, "Invalid credentials")
+
+    if username != ADMIN_USERNAME or not verify_admin_password(password):
+        logger.warning(f"Admin login failed from {get_client_ip(request)} for username={username!r}")
+        raise HTTPException(401, "Invalid credentials")
+
+    token = jwt.encode({
+        "sub": username,
+        "role": "admin",
+        "exp": datetime.utcnow() + timedelta(hours=ADMIN_TOKEN_EXPIRE_HOURS)
+    }, SECRET_KEY, algorithm=ALGORITHM)
+    return {"access_token": token, "token_type": "bearer"}
 
 @app.get("/api/settings")
 async def get_public_settings():
@@ -2432,7 +1800,7 @@ async def get_public_settings():
 
 @app.get("/api/categories")
 async def get_categories():
-    categories = await categories_col.find().sort("order", 1).to_list(None)
+    categories = await categories_col.find().sort("order", 1).to_list(1000)
     return [serialize_doc(c) for c in categories]
 
 # Redundant endpoint removed in favor of the unified /api/schedules above
@@ -2440,35 +1808,105 @@ async def get_categories():
 
 @app.get("/api/categories/{category_id}/channels")
 async def get_category_channels(category_id: str):
-    query = {
-        "active": True,
-        "$or": [
-            {"category_id": category_id},
-            {"categoryId": category_id}
-        ]
-    }
-    channels = await channels_col.find(query).sort("order", 1).to_list(None)
+    query = {"active": True, "category_id": category_id}
+    # ✅ SORTED BY ORDER THEN NAME
+    channels = await channels_col.find(query).sort([("order", 1), ("name", 1)]).to_list(1000)
     return [serialize_doc(c) for c in channels]
 
 @app.get("/api/channels/public")
 async def get_channels(category_id: Optional[str] = None):
     query = {"active": True}
     if category_id:
-        # Normalize: Accept both category_id and categoryId by checking both or normalizing query
-        # But per requirements, we treat category_id as canonical.
-        # If the DB has inconsistent fields, we might need an $or query.
-        query["$or"] = [
-            {"category_id": category_id},
-            {"categoryId": category_id}
-        ]
+        query["category_id"] = category_id
     
-    channels = await channels_col.find(query).sort("order", 1).to_list(None)
+    # ✅ SORTED BY ORDER THEN NAME
+    channels = await channels_col.find(query).sort([("order", 1), ("name", 1)]).to_list(1000)
     return [serialize_doc(c) for c in channels]
 
 @app.get("/api/banners")
 async def get_banners():
-    banners = await banners_col.find({"active": True}).to_list(None)
+    banners = await banners_col.find({"active": True}).to_list(1000)
     return [serialize_doc(b) for b in banners]
+
+# ══════════════════════════════════════════════════════════════════════════
+# PATCH 3 — /api/vipindi  (Featured TV Programs / Episodes)
+# App calls GET /api/vipindi → List<KipendiDto>
+# KipendiDto = { id, name, thumbnailUrl, channelId, active }
+# ══════════════════════════════════════════════════════════════════════════
+
+def _serialize_vipindi(doc: dict) -> dict:
+    """Serialize a vipindi document to the KipendiDto shape the app expects."""
+    if not doc:
+        return {}
+    return {
+        "id":           doc.get("id") or str(doc.get("_id", "")),
+        "name":         doc.get("name", ""),
+        "thumbnailUrl": doc.get("thumbnailUrl") or doc.get("thumbnail_url", ""),
+        "channelId":    doc.get("channelId") or doc.get("channel_id", ""),
+        "active":       bool(doc.get("active", True)),
+    }
+
+@app.get("/api/vipindi")
+async def get_vipindi():
+    """
+    Returns featured TV programs for the home screen MechiNaVipindi section.
+    Returns only active items, sorted by order then name.
+    Returns [] when collection is empty — app handles that gracefully.
+    """
+    items = await vipindi_col.find({"active": True}).sort(
+        [("order", 1), ("name", 1)]
+    ).to_list(200)
+    return [_serialize_vipindi(doc) for doc in items]
+
+# ── Admin CRUD so you can manage vipindi from the admin panel ─────────────
+
+@app.get("/admin/vipindi")
+async def admin_list_vipindi(admin: dict = Depends(get_current_admin)):
+    items = await vipindi_col.find().sort([("order", 1), ("name", 1)]).to_list(1000)
+    return [_serialize_vipindi(doc) for doc in items]
+
+@app.post("/admin/vipindi")
+async def admin_create_vipindi(
+    payload: dict,
+    admin: dict = Depends(get_current_admin)
+):
+    item = {
+        "id":           payload.get("id") or str(uuid.uuid4()),
+        "name":         payload.get("name", ""),
+        "thumbnailUrl": payload.get("thumbnailUrl") or payload.get("thumbnail_url", ""),
+        "channelId":    payload.get("channelId") or payload.get("channel_id", ""),
+        "active":       bool(payload.get("active", True)),
+        "order":        int(payload.get("order", 0)),
+    }
+    await vipindi_col.update_one(
+        {"id": item["id"]}, {"$set": item}, upsert=True
+    )
+    return _serialize_vipindi(item)
+
+@app.put("/admin/vipindi/{item_id}")
+async def admin_update_vipindi(
+    item_id: str,
+    payload: dict,
+    admin: dict = Depends(get_current_admin)
+):
+    payload["id"] = item_id
+    if "thumbnail_url" in payload and "thumbnailUrl" not in payload:
+        payload["thumbnailUrl"] = payload.pop("thumbnail_url")
+    if "channel_id" in payload and "channelId" not in payload:
+        payload["channelId"] = payload.pop("channel_id")
+    await vipindi_col.update_one(
+        {"id": item_id}, {"$set": payload}, upsert=True
+    )
+    updated = await vipindi_col.find_one({"id": item_id})
+    return _serialize_vipindi(updated)
+
+@app.delete("/admin/vipindi/{item_id}")
+async def admin_delete_vipindi(
+    item_id: str,
+    admin: dict = Depends(get_current_admin)
+):
+    await vipindi_col.delete_one({"id": item_id})
+    return {"status": "OK"}
 
 # ✅ Step 3 — Harden /api/relay/stream/{token} for ExoPlayer
 from fastapi.responses import StreamingResponse
@@ -2532,203 +1970,6 @@ def modify_mpd_manifest(mpd_xml: str, session_token: str, base_url: str = "https
     except Exception as e:
         logger.error(f"❌ MPD MODIFICATION FAILED | error={e}")
         return mpd_xml  # Fallback to original
-
-
-# -------------------------------------------------
-# HLS Proxy Logic (Integrated)
-# -------------------------------------------------
-
-def rewrite_m3u8(content: str, base_url: str, proxy_base: str) -> str:
-    """Rewrites M3U8 content to route all links through the proxy."""
-    logger.info(f"📝 Rewriting M3U8 | base_url={base_url} | proxy_base={proxy_base}")
-    lines = content.splitlines()
-    new_lines = []
-    for line in lines:
-        line = line.strip()
-        if not line: continue
-        if line.startswith("#"):
-            if 'URI="' in line:
-                parts = line.split('URI="')
-                uri_part = parts[1].split('"')[0]
-                full_uri = urljoin(base_url, uri_part)
-                proxied_uri = f"{proxy_base}?url={quote(full_uri)}"
-                line = line.replace(uri_part, proxied_uri)
-            new_lines.append(line)
-        else:
-            full_url = urljoin(base_url, line)
-            new_lines.append(f"{proxy_base}?url={quote(full_url)}")
-    logger.info(f"✅ M3U8 Rewritten | lines={len(new_lines)}")
-    return "\n".join(new_lines)
-
-@app.get("/api/hls/proxy")
-async def hls_proxy(url: str, request: Request, user_agent: Optional[str] = Header(None, alias="User-Agent"), referer: Optional[str] = Header(None, alias="Referer"), origin: Optional[str] = Header(None, alias="Origin")):
-    """Proxy endpoint for HLS streams with custom headers."""
-    target_url = unquote(url)
-    logger.info(f"🔍 HLS Proxy Request | target_url={target_url}")
-    
-    # Default headers (can be improved by passing a session token)
-    
-    if is_ycn_provider(target_url):
-        logger.info(f"✅ YCN Provider Detected | host={_host(target_url)}")
-        # For YCN, we MUST use the preset User-Agent to match the Referer/Origin
-        # We only override if the current UA is missing or is the default ExoPlayer UA
-        if not user_agent or "ExoPlayer" in user_agent or "ReactNativeVideo" in user_agent:
-            user_agent = HET140_PRESET["user_agent"]
-            logger.info(f"   -> Forced Preset User-Agent: {user_agent[:50]}...")
-        
-        if not referer:
-            referer = HET140_PRESET["referer"]
-            logger.info(f"   -> Applied Preset Referer: {referer}")
-        
-        if invalid_origin(origin):
-            origin = HET140_PRESET["origin"]
-            logger.info(f"   -> Applied Preset Origin: {origin}")
-    else:
-        logger.info(f"ℹ️ Not a YCN Provider | host={_host(target_url)}")
-
-    # normalize referer slash
-    if referer and not referer.endswith("/"):
-        referer += "/"
-
-    is_playlist = target_url.split("?")[0].lower().endswith(".m3u8")
-
-    headers = {
-        "User-Agent": user_agent or DEFAULT_UA,
-        "Connection": "keep-alive",
-        "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*" if is_playlist else "*/*",
-    }
-    if referer:
-        headers["Referer"] = referer
-    if origin:
-        headers["Origin"] = origin
-    
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        try:
-            resp = await client.get(target_url, headers=headers)
-            
-            if resp.status_code == 403:
-                logger.error(f"❌ 403 Forbidden from Provider | target_url={target_url}")
-                logger.error(f"   -> Request Headers Sent: {headers}")
-                # Log a bit of the response body to see the error message
-                body_preview = (await resp.aread())[:200]
-                logger.error(f"   -> Response Body Preview: {body_preview}")
-
-            allow = {
-                "content-type", "content-length", "accept-ranges", "content-range",
-                "cache-control", "expires", "date", "etag", "last-modified",
-            }
-            passthrough = {k: v for k, v in resp.headers.items() if k.lower() in allow}
-            content_type = resp.headers.get("content-type", "").lower()
-            
-            if "mpegurl" in content_type or target_url.split('?')[0].endswith(".m3u8"):
-                # It's a playlist, rewrite it
-                # Use absolute URL for proxy_base to ensure rewritten links are reachable
-                base_url = str(request.base_url).rstrip('/')
-                proxy_base = f"{base_url}/api/hls/proxy"
-                rewritten = rewrite_m3u8(resp.text, target_url, proxy_base)
-                return Response(
-                    content=rewritten,
-                    media_type="application/vnd.apple.mpegurl",
-                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"}
-                )
-            else:
-                # It's a segment, stream it
-                return StreamingResponse(
-                    resp.aiter_bytes(),
-                    status_code=resp.status_code,
-                    media_type=content_type,
-                    headers=passthrough
-                )
-        except Exception as e:
-            logger.error(f"HLS Proxy error: {e}")
-            raise HTTPException(500, str(e))
-
-def _build_proxy_headers(session: Dict[str, Any], accept: str = "*/*") -> Dict[str, str]:
-    headers = {
-        "User-Agent": EXO_OR_BROWSER_UA,
-        "Accept": accept,
-    }
-    for k, v in (session.get("headers") or {}).items():
-        if v and k.lower() not in ("user-agent", "accept-encoding", "host", "content-length"):
-            headers[k] = v
-    return headers
-
-
-def _build_proxy_target(upstream_mpd: str, resource_path: str = "") -> str:
-    base = upstream_mpd.rsplit('/', 1)[0] + '/'
-    clean_path = (resource_path or '').lstrip('/')
-    return urljoin(base, clean_path) if clean_path else upstream_mpd
-
-
-@app.get("/api/mpd/clearkey-proxy/{token}")
-@app.get("/api/mpd/clearkey-proxy/{token}/{resource_path:path}")
-async def clearkey_mpd_proxy(token: str, resource_path: str = ""):
-    session = await sessions_col.find_one({"token": token, "active": True})
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-    if session.get("expiresAt") and session["expiresAt"] < datetime.utcnow():
-        logger.warning(f"⏰ ClearKey MPD proxy session expired | token={token}")
-        raise HTTPException(status_code=401, detail="Session expired")
-
-    upstream_mpd = session.get("resolved_mpd") or session.get("upstream_mpd")
-    if not upstream_mpd:
-        raise HTTPException(status_code=400, detail="No upstream MPD configured")
-
-    target_url = _build_proxy_target(upstream_mpd, resource_path)
-    is_manifest_request = not resource_path
-    accept = "application/dash+xml,application/xml,text/xml,*/*" if is_manifest_request else "*/*"
-    headers = _build_proxy_headers(session, accept=accept)
-
-    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-        try:
-            upstream = await client.get(target_url, headers=headers)
-            content = await upstream.aread()
-            if upstream.status_code != 200:
-                logger.error(
-                    f"❌ ClearKey proxy upstream fetch failed | target={target_url} | status={upstream.status_code} | body={content[:300]}"
-                )
-                raise HTTPException(status_code=upstream.status_code if upstream.status_code in (401, 403, 404) else 502, detail="Upstream proxy fetch failed")
-
-            if is_manifest_request:
-                charset = upstream.encoding or 'utf-8'
-                mpd_text = content.decode(charset, errors='replace')
-                manifest_base_url = f"/api/mpd/clearkey-proxy/{token}/"
-                
-                # Extract KID from session for explicit injection
-                kid_hex = None
-                license_url = session.get("license_url")
-                if license_url and ":" in license_url:
-                    kid_hex = license_url.split(":")[0].strip()
-                
-                rewritten = rewrite_mpd_for_clearkey_android(mpd_text, manifest_base_url=manifest_base_url, kid_hex=kid_hex)
-                return Response(
-                    content=rewritten.encode('utf-8'),
-                    media_type="application/dash+xml",
-                    headers={
-                        "Access-Control-Allow-Origin": "*",
-                        "Access-Control-Expose-Headers": "*",
-                        "Cache-Control": "no-store, no-cache, must-revalidate",
-                        "Pragma": "no-cache",
-                        "Expires": "0",
-                    },
-                )
-
-            content_type = upstream.headers.get("content-type") or "application/octet-stream"
-            passthrough_headers = {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Expose-Headers": "*",
-                "Cache-Control": upstream.headers.get("cache-control", "no-store"),
-                "Accept-Ranges": upstream.headers.get("accept-ranges", "bytes"),
-            }
-            if upstream.headers.get("content-length"):
-                passthrough_headers["Content-Length"] = upstream.headers["content-length"]
-            return Response(content=content, media_type=content_type, headers=passthrough_headers)
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"❌ ClearKey MPD proxy error | target={target_url} | error={e}")
-            raise HTTPException(status_code=500, detail="ClearKey MPD proxy error")
-
 
 @app.get("/api/relay/stream/{token}")
 async def relay_stream(token: str):
@@ -3014,31 +2255,9 @@ async def admin_manage_user(
 
 
 
-@app.api_route("/api/clearkey/{kid_hex}/{key_hex}", methods=["GET", "POST"])
-@app.api_route("/api/clearkey/{kid_hex}/{key_hex}", methods=["GET", "POST"])
-async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
-    """
-    ClearKey license endpoint.
-
-    Note: The Android app primarily uses LocalMediaDrmCallback (keys embedded in drm_data),
-    but keeping this endpoint correct helps WebView/Shaka testing and any future clients.
-    """
-    logger.info(f"🔑 ClearKey license requested | KID: {kid_hex}")
-    payload = build_clearkey_json(f"{kid_hex}:{key_hex}")
-    # Some players expect 'type' in the JSON (e.g., 'temporary')
-    if isinstance(payload, dict) and 'type' not in payload:
-        payload['type'] = 'temporary'
-    return JSONResponse(
-        content=payload,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Expose-Headers": "*",
-            "Cache-Control": "no-store, no-cache, must-revalidate",
-            "Pragma": "no-cache",
-        },
-    )
 @app.post("/session/heartbeat")
-async def session_heartbeat(payload: dict):
+async def session_heartbeat(payload: dict, request: Request):
+    enforce_client_integrity(request)
     token = payload.get("token")
     uuid_ = payload.get("uuid")
     seconds = payload.get("seconds", 30)
@@ -3049,6 +2268,8 @@ async def session_heartbeat(payload: dict):
     session = await sessions_col.find_one({"token": token, "uuid": uuid_, "active": True})
     if not session:
         raise HTTPException(401, "Session expired or invalid")
+    if request.headers.get("X-DEVICE-ID") and request.headers.get("X-DEVICE-ID") != uuid_:
+        raise HTTPException(401, "Device header mismatch")
     
     # Update session expiry
     new_expiry = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
@@ -3060,98 +2281,49 @@ async def session_heartbeat(payload: dict):
     device = await devices_col.find_one({"uuid": uuid_})
     if not device:
         raise HTTPException(404, "Device not found")
+    if device.get("isBlocked"):
+        raise HTTPException(403, "Device blocked")
     
-    # ============================================================================
-    # 🔥 CRITICAL FIX: Proper Premium User Handling with Type Safety
-    # ============================================================================
+    # ✅ FIX: Check if Premium has expired MID-STREAM
+    is_premium = device.get("isPremium", False)
+    premium_until = device.get("premiumUntil")
     now = datetime.utcnow()
-    
-    # ✅ FIX #1: Explicit boolean type checking (handle string "true"/"false")
-    is_premium_raw = device.get("isPremium") or device.get("is_premium")
-    if isinstance(is_premium_raw, str):
-        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
-    else:
-        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
-    
-    premium_until = device.get("premiumUntil") or device.get("premium_until")
-    
-    logger.info(f"🔍 Heartbeat Debug | uuid={uuid_} | is_premium={is_premium} | premium_until={premium_until}")
 
-    # ============================================================================
-    # PREMIUM USER VALIDATION
-    # ============================================================================
     if is_premium:
-        # Validate that premium subscription is still active
-        if premium_until and isinstance(premium_until, datetime):
-            if premium_until <= now:
-                logger.warning(f"🚫 Premium subscription EXPIRED for {uuid_} | expired_at={premium_until}")
-                
-                TRIAL_AFTER_DOWNGRADE = 5
-                
-                # ✅ Downgrade immediately + restore trial seconds to DB
-                await devices_col.update_one(
-                    {"uuid": uuid_},
-                    {"$set": {
-                        "isPremium": False,
-                        "premiumUntil": None,
-                        "currentPackage": None,
-                        "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-                        "trialUsed": False,
-                        "trialPausedAt": None,
-                        "lastChannelId": None,
-                        "downgradedAt": now
-                    }}
-                )
-                
-                logger.info(f"✅ Downgraded user {uuid_} and restored 5s trial")
-                
-                # Return trial seconds so app can continue
-                return {
-                    "success": True,
-                    "action": "CONTINUE",
-                    "isPremium": False,
-                    "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-                    "message": "Subscription expired. Trial started."
-                }
-            else:
-                # ✅ Premium is still valid - RETURN IMMEDIATELY
-                logger.info(f"✅ Premium VALID for {uuid_} | expires={premium_until}")
-                return {
-                    "success": True,
-                    "action": "CONTINUE",
-                    "isPremium": True,
-                    "trialRemaining": 0  # Premium users have NO trial counter
-                }
-        else:
-            # ✅ Premium is True but no expiry date found - GRANT ACCESS
-            # This shouldn't happen, but treat as valid premium to be safe
-            logger.warning(f"⚠️ Premium=true but missing premiumUntil for {uuid_} - granting access")
-            return {
-                "success": True,
-                "action": "CONTINUE",
-                "isPremium": True,
-                "trialRemaining": 0
-            }
-
-    # ============================================================================
-    # FREE USER TRIAL LOGIC (Only for non-premium users)
-    # ============================================================================
-    if not is_premium:
-        remaining = int(device.get("trialRemaining") or 0)
-        if remaining <= 0:
-            TRIAL_AFTER_DOWNGRADE = 5
+        if premium_until and premium_until <= now:
+            logger.info(f"🚫 Premium expired mid-stream for {uuid_}")
+            
+            # Downgrade immediately
             await devices_col.update_one(
                 {"uuid": uuid_},
-                {"$set": {"trialRemaining": TRIAL_AFTER_DOWNGRADE, "trialUsed": False, "trialPausedAt": None}}
+                {"$set": {
+                    "isPremium": False, 
+                    "premiumUntil": None,
+                    "downgradedAt": now,
+                    "trialRemaining": 0,
+                    "trialUsed": True
+                }}
             )
-            remaining = TRIAL_AFTER_DOWNGRADE
-            device["trialRemaining"] = remaining
-            device["trialUsed"] = False
-            logger.info(f"🔄 Reset trial for free user {uuid_} to 5s")
+            
+            # Return EXPIRED so the app shows paywall
+            return {
+                "success": False,
+                "action": "EXPIRED",
+                "trialRemaining": 0,
+                "message": "Your subscription has just expired. Please upgrade to continue."
+            }
+        
+        # User is valid premium
+        return {
+            "success": True,
+            "action": "CONTINUE",
+            "isPremium": True,
+            "trialRemaining": 0
+        }
 
-    # ============================================================================
-    # CHECK IF WATCHING PREMIUM CHANNEL (Only matters for free users)
-    # ============================================================================
+    # --- BELOW IS EXISTING FREE/TRIAL LOGIC (UNCHANGED) ---
+    
+    # We need to know if the current session is for a premium channel
     last_channel_id = device.get("lastChannelId")
     is_watching_premium = False
     
@@ -3159,27 +2331,12 @@ async def session_heartbeat(payload: dict):
         channel = await channels_col.find_one({"id": last_channel_id})
         if channel and channel.get("is_premium"):
             is_watching_premium = True
-            logger.info(f"📺 User {uuid_} watching premium channel {last_channel_id}")
-    
-    # ✅ FIX #2: Premium users should NEVER hit trial/paywall logic
-    # Double-check that premium users don't continue to trial logic
-    if is_premium:
-        logger.warning(f"🚨 SAFETY BREACH: Premium user {uuid_} reached trial logic section! Returning CONTINUE.")
-        return {
-            "success": True,
-            "action": "CONTINUE",
-            "isPremium": True,
-            "trialRemaining": 0
-        }
     
     if is_watching_premium:
         trial_remaining = device.get("trialRemaining", 0)
         trial_used = device.get("trialUsed", False)
         
-        logger.info(f"⏱️ Free user {uuid_} on premium channel | trial_used={trial_used} | trial_remaining={trial_remaining}s")
-        
         if trial_used and trial_remaining <= 0:
-            logger.warning(f"❌ PAYWALL: Trial exhausted for {uuid_}")
             return {
                 "success": False,
                 "action": "EXPIRED",
@@ -3197,8 +2354,6 @@ async def session_heartbeat(payload: dict):
             }}
         )
         
-        logger.info(f"⏱️ Trial countdown: {trial_remaining}s → {new_trial}s for {uuid_}")
-        
         return {
             "success": True if new_trial > 0 else False,
             "action": "EXPIRED" if new_trial <= 0 else "CONTINUE",
@@ -3207,7 +2362,6 @@ async def session_heartbeat(payload: dict):
         }
     else:
         # Watching free channel
-        logger.info(f"✅ Free user {uuid_} on free channel - CONTINUE")
         return {
             "success": True,
             "action": "CONTINUE",
@@ -3216,423 +2370,493 @@ async def session_heartbeat(payload: dict):
 
 # ✅ THIS IS THE NEW PART YOU ARE ADDING:
 @app.post("/playback/heartbeat")
-async def playback_heartbeat_alias(payload: dict):
+async def playback_heartbeat_alias(payload: dict, request: Request):
     """
     🔀 ALIAS: Redirects /playback/heartbeat -> /session/heartbeat
     This ensures the Android app connects successfully.
     """
-    return await session_heartbeat(payload)
+    return await session_heartbeat(payload, request)
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                     ✅ SONICPESA INTEGRATION                            ║
+# ║                     ✅ ZENOPAY INTEGRATION (FIXED)                         ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
-
-async def _load_package_doc(package_id: str):
-    config = await config_col.find_one({"name": "global"}) or {}
-    package_doc = next((p for p in config.get("packages", []) if str(p.get("id")) == str(package_id)), None)
-    return config, package_doc
-
-
-async def _apply_successful_payment_upgrade(payment: dict, package_doc: dict | None, *, now: Optional[datetime] = None,
-                                           reference: Optional[str] = None, transid: Optional[str] = None,
-                                           channel: Optional[str] = None, payload: Optional[dict] = None,
-                                           source: str = "sonicpesa") -> dict:
-    now = now or datetime.utcnow()
-    duration_td = _duration_td_from_package_or_payment(package_doc, payment)
-    duration_seconds = int(duration_td.total_seconds())
-    duration_days = max(1, int((duration_seconds + 86399) // 86400))
-    uuid_ = payment["uuid"]
-
-    device = await devices_col.find_one({"uuid": uuid_}) or {}
-    is_premium = device.get("isPremium") or device.get("is_premium") or False
-    premium_until_val = device.get("premiumUntil") or device.get("premium_until")
-
-    if is_premium and premium_until_val:
-        base_date = max(premium_until_val, now)
-        premium_until = base_date + duration_td
-    else:
-        premium_until = now + duration_td
-
-    await devices_col.update_one(
-        {"uuid": uuid_},
-        {"$set": {
-            "isPremium": True,
-            "is_premium": True,
-            "premiumUntil": premium_until,
-            "premium_until": premium_until,
-            "currentPackage": payment.get("package"),
-            "trialRemaining": 0,
-            "trialUsed": True,
-            "upgradedAt": now
-        }}
-    )
-
-    update_fields = {
-        "status": "COMPLETED",
-        "duration_seconds": duration_seconds,
-        "durationSeconds": duration_seconds,
-        "duration_days": duration_days,
-        "durationDays": duration_days,
-        "updatedAt": now,
-        "gateway": source,
-    }
-    if reference is not None:
-        update_fields["reference"] = reference
-    if transid is not None:
-        update_fields["transid"] = transid
-    if channel is not None:
-        update_fields["channel"] = channel
-    if payload is not None:
-        update_fields["webhook_payload"] = payload
-
-    await payments_col.update_one({"_id": payment["_id"]}, {"$set": update_fields})
-    logger.info(f"🚀 Device {uuid_} upgraded until {premium_until}")
-    return {"premiumUntil": premium_until, "durationSeconds": duration_seconds, "durationDays": duration_days}
-
-
-async def _fetch_sonicpesa_order_status(order_id: str) -> dict | None:
-    if not SONICPESA_API_KEY:
-        return None
-
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(
-            f"{SONICPESA_BASE_URL}/payment/order_status",
-            json={"order_id": order_id},
-            headers={
-                "Content-Type": "application/json",
-                "X-API-KEY": SONICPESA_API_KEY,
-            },
-        )
-
-    if resp.status_code == 404:
-        logger.info(f"ℹ️ SonicPesa: Order {order_id} not found yet (404). Keeping as PENDING.")
-        return {"payment_status": "PENDING", "raw": None}
-
-    if resp.status_code != 200:
-        logger.warning(f"⚠️ SonicPesa order_status returned {resp.status_code}: {resp.text}")
-        raise HTTPException(502, "Could not verify payment status")
-
-    sonic_data = resp.json()
-    data = sonic_data.get("data") or {}
-    transaction = sonic_data.get("transaction") or {}
-    raw_status = data.get("payment_status") or transaction.get("status") or sonic_data.get("status")
-    return {
-        "payment_status": normalize_gateway_payment_status(raw_status),
-        "raw": sonic_data,
-        "reference": data.get("reference"),
-        "transid": data.get("transid"),
-        "channel": data.get("channel"),
-        "msisdn": data.get("msisdn") or data.get("phone"),
-    }
-
 
 @app.post("/payment/start")
 async def start_payment(payload: dict):
     """
-    🚀 INITIATE SONICPESA PAYMENT
-    Frontend-compatible endpoint retained as /payment/start.
+    🚀 INITIATE ZENOPAY PAYMENT
+    
+    Request body:
+    {
+        "phone": "0744963858",       # Tanzanian mobile number
+        "package": "monthly_15k",    # Package ID from config
+        "uuid": "device-uuid-here",  # Device identifier
+        "name": "John Doe",          # Optional: buyer name
+        "email": "user@example.com"  # Optional: buyer email
+    }
     """
-    phone = payload.get("phone") or payload.get("phone_number") or ""
-    normalized_phone = normalize_phone(phone) if phone else ""
+    phone = payload.get("phone")
+    
+    # 🔧 PATCH 7: Normalize phone number to 255 format for ZenoPay
+    normalized_phone = normalize_phone(phone)
     package_id = payload.get("package")
     uuid_ = payload.get("uuid")
     name = payload.get("name", "pixtvmax User")
     email = payload.get("email", "noemail@pixtv.app")
 
-    if not package_id or not uuid_:
-        raise HTTPException(400, "package and uuid are required")
-    if not normalized_phone:
-        raise HTTPException(400, "A valid Tanzanian phone number is required")
-    if not SONICPESA_API_KEY:
-        logger.error("❌ SONICPESA_API_KEY not configured!")
+    # ✅ Validation
+    if not phone or not package_id or not uuid_:
+        raise HTTPException(400, "phone, package and uuid are required")
+    
+    if not ZENO_API_KEY:
+        logger.error("❌ ZENO_API_KEY not configured!")
         raise HTTPException(500, "Payment system not configured")
 
-    _, package_doc = await _load_package_doc(package_id)
+    # ✅ Fetch package details from config
+    config = await config_col.find_one({"name": "global"})
+    if not config:
+        raise HTTPException(500, "Server config missing")
+
+    package_doc = next(
+        (p for p in config.get("packages", []) if p.get("id") == package_id),
+        None
+    )
     if not package_doc:
         raise HTTPException(404, "Invalid package")
 
     amount = int(package_doc.get("price", 0))
-    duration_td = _duration_td_from_package_or_payment(package_doc, None)
-    duration_seconds = int(duration_td.total_seconds())
-    if duration_seconds <= 0:
-        raise HTTPException(500, "Package duration misconfigured")
-    duration_days = max(1, int((duration_seconds + 86399) // 86400))
+    duration_days = int(package_doc.get("duration_days", 30))
 
-    local_order_id = str(uuid.uuid4())
-    logger.info(f"💳 Starting SonicPesa payment: local_order_id={local_order_id}, phone={normalized_phone}, amount={amount}")
+    # ✅ Generate unique order ID (MUST be UUID format per ZenoPay spec)
+    order_id = str(uuid.uuid4())
 
-    await payments_col.insert_one({
-        "order_id": local_order_id,
-        "orderId": local_order_id,
-        "gatewayOrderId": None,
-        "uuid": uuid_,
-        "package": package_id,
-        "package_name": package_doc.get("name"),
-        "duration_days": duration_days,
-        "duration_seconds": duration_seconds,
-        "durationSeconds": duration_seconds,
-        "duration_unit": (package_doc.get("durationUnit") or package_doc.get("duration_unit")),
-        "duration_value": (package_doc.get("durationValue") or package_doc.get("duration_value")),
-        "phone": normalized_phone,
-        "amount": amount,
-        "currency": "TZS",
-        "status": "PENDING",
-        "gateway": "sonicpesa",
-        "createdAt": datetime.utcnow(),
-        "gateway_response": None,
-        "webhook_payload": None
-    })
+    logger.info(f"💳 Starting payment: order_id={order_id}, phone={phone}, amount={amount}")
 
-    sonic_payload = {
+    # ✅ Save payment record as PENDING
+    try:
+        await payments_col.insert_one({
+            "order_id": order_id,  # Used in your logic
+            "orderId": order_id,   # Used by your index
+            "uuid": uuid_,
+            "package": package_id,
+            "package_name": package_doc.get("name"),
+            "duration_days": duration_days,
+            "phone": phone, # Store original phone number
+            "amount": amount,
+            "currency": "TZS",
+            "status": "PENDING",
+            "createdAt": datetime.utcnow(),
+            "zeno_response": None,
+            "webhook_payload": None
+        })
+    except Exception as e:
+        logger.error(f"❌ Database error: {e}")
+        raise HTTPException(500, "Failed to create payment record")
+
+    # ✅ Call ZenoPay API
+    zeno_payload = {
+        "order_id": order_id,
         "buyer_name": name,
-        "buyer_phone": normalized_phone,
+        "buyer_phone": normalized_phone, # Use normalized phone for ZenoPay
         "buyer_email": email,
         "amount": amount,
-        "currency": "TZS",
     }
-    if SONICPESA_WEBHOOK_URL:
-        sonic_payload["webhook_url"] = SONICPESA_WEBHOOK_URL
+    
+    # Only include webhook_url if configured
+    if ZENO_WEBHOOK_URL:
+        zeno_payload["webhook_url"] = ZENO_WEBHOOK_URL
 
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            logger.info(f"📤 Calling SonicPesa API: {sonic_payload}")
+            logger.info(f"📤 Calling ZenoPay API: {zeno_payload}")
+            
             resp = await client.post(
-                f"{SONICPESA_BASE_URL}/payment/create_order",
-                json=sonic_payload,
+                "https://zenoapi.com/api/payments/mobile_money_tanzania",
+                json=zeno_payload,
                 headers={
                     "Content-Type": "application/json",
-                    "X-API-KEY": SONICPESA_API_KEY,
+                    "x-api-key": ZENO_API_KEY,
                 },
             )
-            logger.info(f"📥 SonicPesa response: status={resp.status_code}, body={resp.text}")
+            
+            logger.info(f"📥 ZenoPay response: status={resp.status_code}, body={resp.text}")
+
     except httpx.TimeoutException:
-        await payments_col.update_one({"order_id": local_order_id}, {"$set": {"status": "FAILED", "error": "Gateway timeout"}})
+        logger.error("❌ ZenoPay API timeout")
+        await payments_col.update_one(
+            {"order_id": order_id},
+            {"$set": {"status": "FAILED", "error": "Gateway timeout"}}
+        )
         raise HTTPException(504, "Payment gateway timeout. Please try again.")
+    
     except Exception as e:
-        await payments_col.update_one({"order_id": local_order_id}, {"$set": {"status": "FAILED", "error": str(e)}})
+        logger.error(f"❌ ZenoPay API error: {e}")
+        await payments_col.update_one(
+            {"order_id": order_id},
+            {"$set": {"status": "FAILED", "error": str(e)}}
+        )
         raise HTTPException(502, "Payment gateway error")
 
+    # ✅ Handle ZenoPay response
     if resp.status_code not in (200, 201, 202):
         error_msg = resp.text
+        logger.error(f"❌ ZenoPay rejected: {error_msg}")
+        
         await payments_col.update_one(
-            {"order_id": local_order_id},
-            {"$set": {"status": "FAILED", "gateway_response": error_msg, "error": f"Gateway rejected with status {resp.status_code}"}}
+            {"order_id": order_id},
+            {"$set": {
+                "status": "FAILED",
+                "zeno_response": error_msg,
+                "error": f"Gateway rejected with status {resp.status_code}"
+            }}
         )
         raise HTTPException(502, f"Payment gateway rejected request: {error_msg}")
 
+    # ✅ Parse success response
     try:
-        sonic_data = resp.json()
-        data = sonic_data.get("data") or {}
-        gateway_order_id = data.get("order_id") or local_order_id
-        raw_status = data.get("payment_status") or data.get("status") or sonic_data.get("status")
-        normalized_status = normalize_gateway_payment_status(raw_status)
-
+        zeno_data = resp.json()
+        
+        # Save ZenoPay response to database
         await payments_col.update_one(
-            {"order_id": local_order_id},
-            {"$set": {
-                "order_id": gateway_order_id,
-                "orderId": gateway_order_id,
-                "gatewayOrderId": gateway_order_id,
-                "reference": data.get("reference"),
-                "gateway_response": sonic_data,
-                "status": normalized_status if normalized_status in ("PENDING", "PROCESSING") else "PENDING",
-            }}
+            {"order_id": order_id},
+            {"$set": {"zeno_response": zeno_data}}
         )
-
+        
+        logger.info(f"✅ Payment initiated successfully: {zeno_data}")
+        
+        # Expected response format:
+        # {
+        #   "status": "success",
+        #   "resultcode": "000",
+        #   "message": "Request in progress. You will receive a callback shortly",
+        #   "order_id": "3rer407fe-3ee8-4525-456f-ccb95de38250"
+        # }
+        
         return {
-            "order_id": gateway_order_id,
-            "status": "PENDING" if normalized_status == "PROCESSING" else normalized_status,
-            "message": sonic_data.get("message", "USSD request sent. Please confirm on your phone."),
-            "sonic_status": data.get("payment_status") or data.get("status") or sonic_data.get("status"),
-            "sonic_reference": data.get("reference"),
+            "paymentUrl": zeno_data.get("payment_url", ""),
+            "orderId": order_id,
+            "order_id": order_id,
+            "status": "PENDING",
+            "message": zeno_data.get("message", "USSD request sent. Please confirm on your phone."),
+            "zeno_status": zeno_data.get("status"),
+            "zeno_resultcode": zeno_data.get("resultcode")
         }
+        
     except Exception as e:
-        logger.error(f"❌ Failed to parse SonicPesa response: {e}")
+        logger.error(f"❌ Failed to parse ZenoPay response: {e}")
         raise HTTPException(502, "Invalid response from payment gateway")
 
 
 @app.get("/payment/status/{order_id}")
 async def payment_status(order_id: str):
     """
-    📊 CHECK PAYMENT STATUS
-    Frontend-compatible endpoint retained as /payment/status/{order_id}.
-    Returns SUCCESS when the user has been upgraded.
+    📊 CHECK PAYMENT STATUS (Frontend Compatible)
+    1. Actively checks ZenoPay if local status is PENDING.
+    2. Translates 'COMPLETED' -> 'SUCCESS' so the app understands it.
     """
-    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}, {"gatewayOrderId": order_id}]}).sort("createdAt", -1)
+    # 1. Find the payment record (Search both key formats)
+    cursor = payments_col.find({
+        "$or": [{"orderId": order_id}, {"order_id": order_id}]
+    }).sort("createdAt", -1)
+    
     payments = await cursor.to_list(length=1)
     if not payments:
         raise HTTPException(404, "Payment not found")
-
+    
     latest_payment = payments[0]
-    current_status = normalize_gateway_payment_status(latest_payment.get("status", "PENDING"))
+    # Default to PENDING if status is missing
+    current_status = latest_payment.get("status", "PENDING")
 
-    if current_status in ("PENDING", "PROCESSING"):
+    # 2. AUTO-FIX: If pending, force check ZenoPay API
+    if current_status == "PENDING":
         try:
-            sonic_status_data = await _fetch_sonicpesa_order_status(order_id)
-            if sonic_status_data:
-                current_status = sonic_status_data["payment_status"]
-                if current_status == "COMPLETED":
-                    _, package_doc = await _load_package_doc(latest_payment.get("package"))
-                    await _apply_successful_payment_upgrade(
-                        latest_payment,
-                        package_doc,
-                        reference=sonic_status_data.get("reference"),
-                        transid=sonic_status_data.get("transid"),
-                        channel=sonic_status_data.get("channel"),
-                        payload=sonic_status_data.get("raw"),
+            if ZENO_API_KEY:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(
+                        f"https://zenoapi.com/api/payments/check_status/{order_id}",
+                        headers={"x-api-key": ZENO_API_KEY}
                     )
-                elif current_status in ("FAILED", "CANCELLED"):
-                    await payments_col.update_one(
-                        {"_id": latest_payment["_id"]},
-                        {"$set": {"status": current_status, "updatedAt": datetime.utcnow(), "gateway_response": sonic_status_data.get("raw")}}
-                    )
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"⚠️ SonicPesa auto-check failed: {e}")
+                    
+                    if resp.status_code == 200:
+                        zeno_data = resp.json()
+                        zeno_status = zeno_data.get("payment_status", "").upper()
+                        
+                        # If Zeno says COMPLETED, upgrade user immediately
+                        if zeno_status == "COMPLETED":
+                            logger.info(f"✅ Auto-Healing: Found COMPLETED payment {order_id}")
+                            
+                            now = datetime.utcnow()
+                            duration_days = int(latest_payment.get("duration_days", 30))
+                            uuid_ = latest_payment["uuid"]
+                            
+                            # Upgrade logic (Same as webhook)
+                            device = await devices_col.find_one({"uuid": uuid_})
+                            
+                            if device and device.get("isPremium") and device.get("premiumUntil"):
+                                current_expiry = device["premiumUntil"]
+                                base_date = max(current_expiry, now)
+                                premium_until = base_date + timedelta(days=duration_days)
+                            else:
+                                premium_until = now + timedelta(days=duration_days)
+                            
+                            await devices_col.update_one(
+                                {"uuid": uuid_},
+                                {"$set": {
+                                    "isPremium": True,
+                                    "premiumUntil": premium_until,
+                                    "currentPackage": latest_payment.get("package"),
+                                    "trialRemaining": 0,
+                                    "trialUsed": True,
+                                    "upgradedAt": now
+                                }}
+                            )
 
-    final_status_for_app = "SUCCESS" if current_status == "COMPLETED" else current_status
-    refreshed_payment = await payments_col.find_one({"_id": latest_payment["_id"]}) or latest_payment
-    device = await devices_col.find_one({"uuid": refreshed_payment["uuid"]})
+                            await payments_col.update_one(
+                                {"_id": latest_payment["_id"]},
+                                {"$set": {
+                                    "status": "COMPLETED",
+                                    "updatedAt": now,
+                                    "auto_healed": True
+                                }}
+                            )
+                            
+                            current_status = "COMPLETED"
+                            
+        except Exception as e:
+            logger.error(f"⚠️ Auto-check failed: {e}")
+
+    # 3. 🚨 THE TRANSLATION FIX 🚨
+    # The database says "COMPLETED", but the App expects "SUCCESS".
+    # We map it here so the App is happy.
+    final_status_for_app = current_status
+    if current_status == "COMPLETED":
+        final_status_for_app = "SUCCESS"
+
+    # 4. Fetch device info for the response
+    device = await devices_col.find_one({"uuid": latest_payment["uuid"]})
 
     return {
         "order_id": order_id,
-        "status": final_status_for_app,
-        "amount": refreshed_payment.get("amount"),
-        "package": refreshed_payment.get("package_name"),
-        "isPremium": (device.get("isPremium") or device.get("is_premium") or False) if device else False,
-        "premiumUntil": (device.get("premiumUntil") or device.get("premium_until")).isoformat() if device and (device.get("premiumUntil") or device.get("premium_until")) else None,
-        "createdAt": refreshed_payment.get("createdAt").isoformat() if refreshed_payment.get("createdAt") else None
+        "status": final_status_for_app, # <--- Sending "SUCCESS"
+        "amount": latest_payment.get("amount"),
+        "package": latest_payment.get("package_name"),
+        "isPremium": device.get("isPremium", False) if device else False,
+        "premiumUntil": device.get("premiumUntil").isoformat() if device and device.get("premiumUntil") else None,
+        "createdAt": latest_payment.get("createdAt").isoformat() if latest_payment.get("createdAt") else None
     }
 
 
 @app.post("/payment/manual-upgrade/{order_id}")
 async def manual_upgrade_trigger(order_id: str):
-    """Fallback trigger that checks SonicPesa and upgrades if payment is successful."""
-    logger.info(f"🔧 Manual SonicPesa upgrade triggered for order_id: {order_id}")
-    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}, {"gatewayOrderId": order_id}]}).sort("createdAt", -1)
+    """
+    🔧 MANUAL UPGRADE TRIGGER (Fallback if webhook fails)
+    
+    This endpoint allows the frontend to manually trigger the upgrade logic
+    if the webhook fails or times out. It checks the payment status from ZenoPay
+    and upgrades the user if payment was completed.
+    """
+    logger.info(f"🔧 Manual upgrade triggered for order_id: {order_id}")
+    
+    # Find payment record
+    cursor = payments_col.find({
+        "$or": [{"orderId": order_id}, {"order_id": order_id}]
+    }).sort("createdAt", -1)
+    
     payments = await cursor.to_list(length=1)
     if not payments:
         raise HTTPException(404, "Payment not found")
-
+    
     payment = payments[0]
-    _, package_doc = await _load_package_doc(payment.get("package"))
-
-    if normalize_gateway_payment_status(payment.get("status")) == "COMPLETED":
+    
+    # If already completed, return success
+    if payment.get("status") == "COMPLETED":
         device = await devices_col.find_one({"uuid": payment["uuid"]})
         return {
             "status": "already_upgraded",
-            "isPremium": (device.get("isPremium") or device.get("is_premium") or False) if device else False,
+            "isPremium": device.get("isPremium", False) if device else False,
             "message": "User already upgraded"
         }
-
-    if not SONICPESA_API_KEY:
+    
+    # Check payment status with ZenoPay API
+    if not ZENO_API_KEY:
         raise HTTPException(500, "Payment system not configured")
+    
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"https://zenoapi.com/api/payments/check_status/{order_id}",
+                headers={"x-api-key": ZENO_API_KEY}
+            )
+            
+            if resp.status_code != 200:
+                logger.error(f"❌ ZenoPay status check failed: {resp.status_code}")
+                raise HTTPException(502, "Could not verify payment status")
+            
+            zeno_data = resp.json()
+            payment_status = zeno_data.get("payment_status", "").upper()
+            
+            logger.info(f"📊 ZenoPay status: {payment_status}")
+            
+            if payment_status != "COMPLETED":
+                return {
+                    "status": "not_completed",
+                    "payment_status": payment_status,
+                    "message": "Payment not yet completed"
+                }
+            
+            # Payment is completed - upgrade user
+            now = datetime.utcnow()
+            duration_days = int(payment.get("duration_days", 30))
+            
+            # Check if user is already premium (top-up logic)
+            device = await devices_col.find_one({"uuid": payment["uuid"]})
+            if device and device.get("isPremium") and device.get("premiumUntil"):
+                current_expiry = device["premiumUntil"]
+                base_date = max(current_expiry, now)
+                premium_until = base_date + timedelta(days=duration_days)
+            else:
+                premium_until = now + timedelta(days=duration_days)
+            
+            # Update device
+            await devices_col.update_one(
+                {"uuid": payment["uuid"]},
+                {"$set": {
+                    "isPremium": True,
+                    "premiumUntil": premium_until,
+                    "currentPackage": payment.get("package"),
+                    "trialRemaining": 0,
+                    "trialUsed": True,
+                    "upgradedAt": now
+                }}
+            )
+            
+            # Update payment record
+            await payments_col.update_one(
+                {"_id": payment["_id"]},
+                {"$set": {
+                    "status": "COMPLETED",
+                    "updatedAt": now,
+                    "manual_upgrade": True
+                }}
+            )
+            
+            logger.info(f"✅ Manual upgrade successful for {payment['uuid']}")
+            
+            return {
+                "status": "upgraded",
+                "isPremium": True,
+                "premiumUntil": premium_until.isoformat(),
+                "message": "Upgrade successful"
+            }
+            
+    except httpx.TimeoutException:
+        raise HTTPException(504, "Payment verification timeout")
+    except Exception as e:
+        logger.error(f"❌ Manual upgrade error: {e}")
+        raise HTTPException(500, "Upgrade failed")
 
-    sonic_status_data = await _fetch_sonicpesa_order_status(order_id)
-    payment_status = sonic_status_data["payment_status"] if sonic_status_data else "PENDING"
-    logger.info(f"📊 SonicPesa status: {payment_status}")
-
-    if payment_status != "COMPLETED":
-        if payment_status in ("FAILED", "CANCELLED"):
-            await payments_col.update_one({"_id": payment["_id"]}, {"$set": {"status": payment_status, "updatedAt": datetime.utcnow()}})
-        return {
-            "status": "not_completed",
-            "payment_status": payment_status,
-            "message": "Payment not yet completed"
-        }
-
-    result = await _apply_successful_payment_upgrade(
-        payment,
-        package_doc,
-        reference=sonic_status_data.get("reference"),
-        transid=sonic_status_data.get("transid"),
-        channel=sonic_status_data.get("channel"),
-        payload=sonic_status_data.get("raw"),
-    )
-
-    await payments_col.update_one({"_id": payment["_id"]}, {"$set": {"manual_upgrade": True}})
-    return {
-        "status": "upgraded",
-        "isPremium": True,
-        "premiumUntil": result["premiumUntil"].isoformat(),
-        "message": "Upgrade successful"
-    }
-
-
-@app.post("/webhooks/sonic")
-@app.post("/payment-webhook")
-@app.post("/webhooks/zeno")
-async def sonicpesa_webhook(request: Request):
-    """🔔 SONICPESA WEBHOOK HANDLER. Legacy routes retained for easier deployment."""
-    logger.info("=" * 80)
-    logger.info("🔔 SONICPESA WEBHOOK RECEIVED - Starting processing")
-    logger.info("=" * 80)
-
-    raw_body = await request.body()
-    signature = request.headers.get("X-SonicPesa-Signature") or request.headers.get("x-sonicpesa-signature")
-    if not verify_sonicpesa_signature(raw_body, signature):
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
-
+# ==========================================
+# 🔧 FIX: Add the route matching your logs
+# ==========================================
+@app.post("/webhooks/zeno")      # <--- THIS IS THE MISSING ROUTE
+@app.post("/payment-webhook")    # Keep this for backward compatibility
+async def zenopay_webhook(request: Request):
+    """🔔 ZENOPAY WEBHOOK HANDLER (Fixed to allow payments)"""
+    logger.info("="*80)
+    logger.info("🔔 WEBHOOK RECEIVED - Starting processing")
+    logger.info("="*80)
+    
+    # 1️⃣ CAPTURE PAYLOAD FIRST (Handle Form or JSON)
     try:
         if "application/json" in request.headers.get("content-type", ""):
-            payload = json.loads(raw_body.decode("utf-8") or "{}")
+            payload = await request.json()
         else:
             form_data = await request.form()
             payload = dict(form_data)
-        logger.info(f"📦 SonicPesa Webhook Payload: {payload}")
+        
+        logger.info(f"📦 Webhook Payload: {payload}")
     except Exception as e:
         logger.error(f"❌ Could not parse webhook body: {e}")
         return {"status": "error", "message": "Parse error"}
 
+    # 2️⃣ AUTH CHECK (RELAXED)
+    received_key = request.headers.get("x-api-key")
+    # Log but don't fail if key is missing (fixes some Zeno gateway versions)
+    if received_key and ZENO_API_KEY and received_key != ZENO_API_KEY:
+        logger.warning(f"⚠️ Webhook Key Mismatch! Proceeding anyway.")
+    
+    # 3️⃣ EXTRACT DATA
     order_id = payload.get("order_id")
-    payment_status = normalize_gateway_payment_status(payload.get("status") or payload.get("payment_status"))
-    reference = payload.get("reference")
-    transid = payload.get("transid")
-    channel = payload.get("channel")
-    event = (payload.get("event") or "").strip().lower()
+    payment_status = (payload.get("payment_status") or "").upper() 
+    reference = payload.get("reference", "")
 
     if not order_id or not payment_status:
-        logger.warning("⚠️ Incomplete SonicPesa webhook payload")
+        logger.warning(f"⚠️ Incomplete webhook payload")
         return {"status": "ignored", "reason": "missing fields"}
 
-    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}, {"gatewayOrderId": order_id}]}).sort("createdAt", -1)
+    # 4️⃣ UPDATE DATABASE
+    # Search for the payment
+    cursor = payments_col.find({
+        "$or": [{"orderId": order_id}, {"order_id": order_id}]
+    }).sort("createdAt", -1)
+    
     payments = await cursor.to_list(length=1)
     if not payments:
         logger.warning(f"⚠️ Payment not found for order_id: {order_id}")
         return {"status": "ignored", "reason": "order_id not found in DB"}
-
+    
     payment = payments[0]
-    _, package_doc = await _load_package_doc(payment.get("package"))
 
-    if normalize_gateway_payment_status(payment.get("status")) == "COMPLETED":
+    # Idempotency (Don't process twice)
+    if payment.get("status") == "COMPLETED":
         logger.info(f"✅ Payment {order_id} already processed")
         return {"status": "already processed"}
 
-    if payment_status == "COMPLETED" or event == "payment.completed":
-        await _apply_successful_payment_upgrade(
-            payment,
-            package_doc,
-            reference=reference,
-            transid=transid,
-            channel=channel,
-            payload=payload,
-        )
-        return {"status": "ok"}
+    # 5️⃣ UPGRADE USER
+    if payment_status == "COMPLETED":
+        logger.info(f"✅ Payment COMPLETED: {order_id}")
+        
+        now = datetime.utcnow()
+        duration_days = int(payment.get("duration_days", 30))
+        uuid_ = payment["uuid"]
 
-    if payment_status in ("FAILED", "CANCELLED"):
+        # Upgrade Logic
+        device = await devices_col.find_one({"uuid": uuid_})
+        
+        if device and device.get("isPremium") and device.get("premiumUntil"):
+            current_expiry = device["premiumUntil"]
+            base_date = max(current_expiry, now)
+            premium_until = base_date + timedelta(days=duration_days)
+        else:
+            premium_until = now + timedelta(days=duration_days)
+
+        # Update Device
+        await devices_col.update_one(
+            {"uuid": uuid_},
+            {"$set": {
+                "isPremium": True,
+                "premiumUntil": premium_until,
+                "currentPackage": payment.get("package"),
+                "trialRemaining": 0,
+                "trialUsed": True,
+                "upgradedAt": now
+            }}
+        )
+
+        # Update Payment Record
         await payments_col.update_one(
             {"_id": payment["_id"]},
-            {"$set": {"status": payment_status, "updatedAt": datetime.utcnow(), "reference": reference, "transid": transid, "channel": channel, "webhook_payload": payload}}
+            {"$set": {
+                "status": "COMPLETED",
+                "updatedAt": now,
+                "reference": reference,
+                "webhook_payload": payload
+            }}
         )
-        return {"status": "ok", "payment_status": payment_status}
+        logger.info(f"🚀 Device {uuid_} upgraded until {premium_until}")
 
-    await payments_col.update_one(
-        {"_id": payment["_id"]},
-        {"$set": {"status": payment_status, "updatedAt": datetime.utcnow(), "reference": reference, "transid": transid, "channel": channel, "webhook_payload": payload}}
-    )
-    return {"status": "ok", "payment_status": payment_status}
+    return {"status": "ok"}
 
 
 
@@ -3676,20 +2900,12 @@ async def expire_subscriptions(admin: dict = Depends(get_current_admin)):
     Can be called manually or via scheduled cron job.
     """
     now = datetime.utcnow()
-    
-    # ✅ pull trialSeconds from config (defaults to 5)
-    flags = await get_admin_flags()
-    trial_seconds = int(flags.get("trialSeconds", 5) or 5)
 
     result = await devices_col.update_many(
         {"isPremium": True, "premiumUntil": {"$lte": now}},
         {"$set": {
             "isPremium": False,
             "premiumUntil": None,
-            "currentPackage": None,
-            "trialRemaining": trial_seconds,
-            "trialPausedAt": None,
-            "lastChannelId": None,
             "downgradedAt": now
         }}
     )
