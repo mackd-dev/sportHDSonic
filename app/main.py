@@ -14,7 +14,6 @@ import httpx
 import base64
 import binascii
 import ipaddress
-from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from urllib.parse import urljoin, quote, unquote, urlparse
@@ -172,7 +171,6 @@ from starlette.requests import Request as StarletteRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from starlette.middleware.trustedhost import TrustedHostMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
@@ -264,56 +262,7 @@ PUBLIC_API_TOKEN = os.getenv("PUBLIC_API_TOKEN", "")
 # Any request that is missing or forges this value gets a 403.
 # Must match APP_CLIENT_SECRET in local.properties / CI env.
 # Generate: python3 -c "import secrets; print(secrets.token_hex(16))"
-
 APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", "")
-ALLOW_LEGACY_SHARED_SIG = os.getenv("ALLOW_LEGACY_SHARED_SIG", "false").strip().lower() in ("1", "true", "yes", "on")
-ALLOW_LEGACY_PUBLIC_TOKEN = os.getenv("ALLOW_LEGACY_PUBLIC_TOKEN", "false").strip().lower() in ("1", "true", "yes", "on")
-APP_TOKEN_EXPIRE_DAYS = max(1, int(os.getenv("APP_TOKEN_EXPIRE_DAYS", "30") or 30))
-APP_SIG_TTL_SECONDS = max(30, int(os.getenv("APP_SIG_TTL_SECONDS", "300") or 300))
-HOST = os.getenv("HOST", "").strip()
-BACKEND_URL = os.getenv("BACKEND_URL", "").strip()
-ALLOWED_ORIGINS_ENV = os.getenv("ALLOWED_ORIGINS", "").strip()
-TRUSTED_HOSTS_ENV = os.getenv("TRUSTED_HOSTS", "").strip()
-
-def _normalize_origin(value: str) -> str:
-    value = (value or "").strip().rstrip("/")
-    if not value:
-        return ""
-    if not value.startswith(("http://", "https://")):
-        value = f"https://{value}"
-    return value.rstrip("/")
-
-def _extract_host(value: str) -> str:
-    try:
-        return (urlparse(value).hostname or "").strip().lower()
-    except Exception:
-        return ""
-
-if ALLOWED_ORIGINS_ENV:
-    ALLOWED_ORIGINS = [o for o in (_normalize_origin(v) for v in ALLOWED_ORIGINS_ENV.split(",")) if o]
-else:
-    _default_origins = [
-        _normalize_origin(HOST),
-        _normalize_origin(BACKEND_URL),
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ]
-    ALLOWED_ORIGINS = sorted({o for o in _default_origins if o})
-
-if TRUSTED_HOSTS_ENV:
-    TRUSTED_HOSTS = [h.strip().lower() for h in TRUSTED_HOSTS_ENV.split(",") if h.strip()]
-else:
-    TRUSTED_HOSTS = sorted({
-        h for h in [
-            _extract_host(HOST),
-            _extract_host(BACKEND_URL),
-            "localhost",
-            "127.0.0.1",
-            "*.up.railway.app",
-        ] if h
-    })
 
 # ── IP guard / anti-clone protection ───────────────────────────────────────
 IP_GUARD_ENABLED = os.getenv("IP_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
@@ -1266,21 +1215,13 @@ async def resolve_lipopotv_stream(player_url: str) -> Optional[Dict[str, Any]]:
 # --- App Setup ---
 # Note: The rest of the file (FastAPI routes, etc.) should follow here.
 # Since I only have the first 500 lines, I'll append the rest from the original file.
-
 app = FastAPI(title="PixTvMax Production API")
 
 app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=TRUSTED_HOSTS or ["*"]
-)
-
-app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS or [],
-    allow_headers=["Authorization", "Content-Type", "X-DEVICE-ID", "X-CLIENT-SIG", "X-CLIENT-TS", "X-CLIENT-NONCE", "X-PACKAGE-NAME", "User-Agent"],
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-    allow_credentials=True,
-    expose_headers=["Content-Type"]
+    allow_origins=["*"],
+    allow_headers=["*"],
+    allow_methods=["*"]
 )
 
 
@@ -1295,109 +1236,6 @@ def _as_bool(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("true", "1", "yes", "on")
     return bool(value)
-
-
-
-_recent_client_nonces: dict[str, float] = {}
-_admin_login_attempts: dict[str, list[float]] = defaultdict(list)
-
-
-def _cleanup_nonce_store(now_ts: float | None = None) -> None:
-    now_ts = now_ts or time.time()
-    stale_keys = [k for k, ts in _recent_client_nonces.items() if now_ts - ts > APP_SIG_TTL_SECONDS]
-    for key in stale_keys:
-        _recent_client_nonces.pop(key, None)
-
-
-def _read_request_body_bytes(request: StarletteRequest) -> bytes:
-    try:
-        body = getattr(request, "_body", b"") or b""
-        if isinstance(body, bytes):
-            return body
-        return bytes(body)
-    except Exception:
-        return b""
-
-
-def _body_sha256_from_request(request: StarletteRequest) -> str:
-    return hashlib.sha256(_read_request_body_bytes(request)).hexdigest()
-
-
-def _build_client_signature(method: str, path: str, device_id: str, ts: str, nonce: str, body_sha256: str) -> str:
-    canonical = "\n".join([
-        (method or "GET").upper(),
-        path or "/",
-        device_id or "",
-        ts or "",
-        nonce or "",
-        body_sha256 or hashlib.sha256(b"").hexdigest(),
-    ])
-    return hmac.new(APP_CLIENT_SECRET.encode(), canonical.encode(), hashlib.sha256).hexdigest()
-
-
-def create_app_access_token(device_id: str) -> str:
-    now = datetime.utcnow()
-    payload = {
-        "sub": device_id,
-        "device_id": device_id,
-        "scope": "app",
-        "iat": now,
-        "exp": now + timedelta(days=APP_TOKEN_EXPIRE_DAYS),
-    }
-    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def verify_app_access_token(token: str, device_id: str) -> bool:
-    if not token or not device_id:
-        return False
-    try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        if payload.get("scope") != "app":
-            return False
-        bound = str(payload.get("device_id") or payload.get("sub") or "").strip()
-        return bool(bound) and hmac.compare_digest(bound, str(device_id).strip())
-    except Exception:
-        return False
-
-
-def issue_app_auth_payload(device_id: str) -> dict:
-    token = create_app_access_token(device_id)
-    return {
-        "public_api_token": token,
-        "app_token": token,
-        "auth_token": token,
-    }
-
-
-def is_allowed_origin(origin: str | None) -> bool:
-    origin = _normalize_origin(origin or "")
-    return bool(origin) and origin in set(ALLOWED_ORIGINS or [])
-
-
-class SecurityHeadersMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: StarletteRequest, call_next):
-        response = await call_next(request)
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-        response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        response.headers.setdefault("Cache-Control", "no-store")
-        if request.url.scheme == "https":
-            response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
-        return response
-
-
-app.add_middleware(SecurityHeadersMiddleware)
-
-
-def is_admin_login_rate_limited(identifier: str) -> bool:
-    now = time.time()
-    bucket = _admin_login_attempts[identifier]
-    _admin_login_attempts[identifier] = [ts for ts in bucket if now - ts < 300]
-    if len(_admin_login_attempts[identifier]) >= 10:
-        return True
-    _admin_login_attempts[identifier].append(now)
-    return False
 
 
 def get_client_ip(request: Request | StarletteRequest) -> str:
@@ -1644,6 +1482,9 @@ _SIG_EXEMPT_PREFIXES = (
     "/drm",
 )
 
+import time
+from collections import defaultdict
+
 # Simple in-memory rate limiter
 _RATE_LIMIT_WINDOW = 60  # seconds
 _RATE_LIMIT_MAX_REQUESTS = 100
@@ -1660,85 +1501,57 @@ def is_rate_limited(identifier: str) -> bool:
 
 class AppIdentityMiddleware(BaseHTTPMiddleware):
     """
-    Validates app requests using:
-    - X-DEVICE-ID on every app request
-    - HMAC request signing headers (preferred) or optional legacy shared signature
-    - Device-bound Bearer token on non-bootstrap routes
+    Validates app requests using Bearer token + X-DEVICE-ID + optional X-Client-Sig.
+    User-Agent is logged but NOT used as a gate — Android WebView UAs vary by device.
+    Real security: PUBLIC_API_TOKEN (Bearer) + APP_CLIENT_SECRET (X-Client-Sig).
     """
     async def dispatch(self, request: StarletteRequest, call_next):
         path = request.url.path
         client_ip = request.client.host if request.client else "?"
 
+        # Always allow: health check, root, OPTIONS pre-flight
         if path in ("/", "/health") or request.method == "OPTIONS":
             return await call_next(request)
 
+        # Always allow exempt prefixes (admin, webhooks, DRM endpoints, etc.)
         if any(path.startswith(p) for p in _SIG_EXEMPT_PREFIXES):
             return await call_next(request)
 
+        # Allow internal Docker/loopback traffic
         if client_ip.startswith("172.") or client_ip in ("127.0.0.1", "::1"):
             return await call_next(request)
 
+        # /device/register only needs X-DEVICE-ID (no Bearer yet at registration)
         is_bootstrap = path in {"/device/register"}
-        body_bytes = await request.body()
-        request._body = body_bytes
-        device_id = request.headers.get("x-device-id", "").strip()
-        if not device_id:
-            logger.warning(f"🚫 Blocked — missing X-DEVICE-ID | path={path} ip={client_ip}")
-            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
+        # 1. X-Client-Sig — enforce if APP_CLIENT_SECRET is configured
         if APP_CLIENT_SECRET:
-            sig = request.headers.get("x-client-sig", "").strip()
-            ts = request.headers.get("x-client-ts", "").strip()
-            nonce = request.headers.get("x-client-nonce", "").strip()
-
-            signature_ok = False
-            if sig and ts and nonce:
-                try:
-                    now_ts = time.time()
-                    req_ts = int(ts)
-                    if abs(now_ts - req_ts) <= APP_SIG_TTL_SECONDS:
-                        _cleanup_nonce_store(now_ts)
-                        nonce_key = f"{device_id}:{nonce}"
-                        if nonce_key not in _recent_client_nonces:
-                            expected = _build_client_signature(
-                                request.method,
-                                request.url.path,
-                                device_id,
-                                ts,
-                                nonce,
-                                _body_sha256_from_request(request),
-                            )
-                            if hmac.compare_digest(expected, sig):
-                                _recent_client_nonces[nonce_key] = now_ts
-                                signature_ok = True
-                except Exception:
-                    signature_ok = False
-
-            if not signature_ok and ALLOW_LEGACY_SHARED_SIG and sig:
-                signature_ok = hmac.compare_digest(sig, APP_CLIENT_SECRET)
-
-            if not signature_ok:
+            sig = request.headers.get("x-client-sig", "")
+            if not sig or not hmac.compare_digest(sig, APP_CLIENT_SECRET):
                 logger.warning(
-                    f"🚫 Blocked — invalid request signature | path={path} ip={client_ip} "
+                    f"🚫 Blocked — bad X-Client-Sig | path={path} ip={client_ip} "
                     f"ua={request.headers.get('user-agent', '')[:60]}"
                 )
                 return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
+        # 2. X-DEVICE-ID — required on all app routes
+        device_id = request.headers.get("x-device-id", "")
+        if not device_id:
+            logger.warning(f"🚫 Blocked — missing X-DEVICE-ID | path={path} ip={client_ip}")
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+        # 3. Bearer token — required on all routes except bootstrap
         if not is_bootstrap:
             auth_header = request.headers.get("authorization", "")
             if not auth_header.startswith("Bearer "):
                 logger.warning(f"🚫 Blocked — missing Bearer token | path={path} ip={client_ip}")
                 return JSONResponse(status_code=403, content={"detail": "Forbidden"})
             provided_token = auth_header[7:].strip()
-            token_ok = False
-            if ALLOW_LEGACY_PUBLIC_TOKEN and PUBLIC_API_TOKEN:
-                token_ok = hmac.compare_digest(provided_token, PUBLIC_API_TOKEN)
-            if not token_ok:
-                token_ok = verify_app_access_token(provided_token, device_id)
-            if not token_ok:
+            if not PUBLIC_API_TOKEN or not hmac.compare_digest(provided_token, PUBLIC_API_TOKEN):
                 logger.warning(f"🚫 Blocked — invalid Bearer token | path={path} ip={client_ip}")
                 return JSONResponse(status_code=403, content={"detail": "Forbidden"})
 
+        # 4. Rate limiting per device
         if is_rate_limited(device_id):
             logger.warning(f"🚫 Rate limited | device={device_id} path={path} ip={client_ip}")
             return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
@@ -2055,7 +1868,7 @@ async def root():
     return {"status": "OK"}
 
 @app.get("/config")
-async def get_config(request: Request, x_device_id: str = Header(None)):
+async def get_config():
     flags = await get_admin_flags()
     banners = await banners_col.find({"active": True}).to_list(100)
     
@@ -2076,7 +1889,10 @@ async def get_config(request: Request, x_device_id: str = Header(None)):
             "whatsapp": whatsapp,
             "telegram": telegram,
         },
-        **issue_app_auth_payload(x_device_id or request.headers.get("x-device-id", "") or "anonymous"),
+        # ✅ Public token — app stores this and uses it as Bearer on all requests
+        "public_api_token": PUBLIC_API_TOKEN,
+        "app_token":        PUBLIC_API_TOKEN,
+        "auth_token":       PUBLIC_API_TOKEN,
     }
 
 
@@ -2327,7 +2143,8 @@ async def register_device(payload: dict, request: Request):
 
     return {
         "status": "BLOCKED" if blocked else "OK",
-        **issue_app_auth_payload(uuid_),
+        "public_api_token": PUBLIC_API_TOKEN,
+        "app_token": PUBLIC_API_TOKEN,
         "uuid": uuid_,
         "blocked": blocked,
         "blockReason": device.get("blockReason"),
@@ -3518,32 +3335,34 @@ async def admin_update_config(config: dict, admin: dict = Depends(get_current_ad
 
 
 
-
 @app.post("/admin/login")
-async def admin_login(payload: dict, request: Request):
-    raw_username = str(payload.get("username") or payload.get("email") or "").strip()
-    raw_password = str(payload.get("password") or "").strip()
+async def admin_login(payload: dict):
+    # 1. Print what we actually received (for debugging)
+    print(f"DEBUG LOGIN PAYLOAD: {payload}") 
 
+    # 2. Check for 'username' OR 'email'
+    raw_username = payload.get("username") or payload.get("email")
+    raw_password = payload.get("password")
+
+    # 3. Safety check: handle empty values
     if not raw_username or not raw_password:
-        raise HTTPException(401, "Invalid credentials")
+        raise HTTPException(401, "Missing username or password")
 
-    client_ip = get_client_ip(request) or (request.client.host if request.client else "unknown")
-    limiter_key = f"{client_ip}:{raw_username.lower()}"
-    if is_admin_login_rate_limited(limiter_key):
-        raise HTTPException(429, "Too many login attempts. Try again later.")
-
-    username_ok = bool(ADMIN_USERNAME) and hmac.compare_digest(raw_username, ADMIN_USERNAME)
-    password_ok = bool(ADMIN_PASSWORD) and hmac.compare_digest(raw_password, ADMIN_PASSWORD)
-
-    if username_ok and password_ok:
+    # 4. Strip whitespace (fix "admin " vs "admin")
+    username = raw_username.strip()
+    password = raw_password.strip()
+    
+    # 5. Compare with Environment Variables
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         token = jwt.encode({
-            "sub": raw_username,
+            "sub": username,
             "role": "admin",
             "exp": datetime.utcnow() + timedelta(days=7)
         }, SECRET_KEY, algorithm=ALGORITHM)
         return {"access_token": token, "token_type": "bearer"}
-
-    logger.warning(f"❌ Admin login rejected | ip={client_ip} user={raw_username}")
+    
+    # If we get here, credentials didn't match
+    print(f"DEBUG: Login failed. Expected '{ADMIN_USERNAME}', got '{username}'")
     raise HTTPException(401, "Invalid credentials")
 
 @app.get("/api/settings")
@@ -4203,6 +4022,8 @@ async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
     return JSONResponse(
         content=payload,
         headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Expose-Headers": "*",
             "Cache-Control": "no-store, no-cache, must-revalidate",
             "Pragma": "no-cache",
         },
