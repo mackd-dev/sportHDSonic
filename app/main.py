@@ -332,48 +332,6 @@ ip_guard_col = db.ip_guard  # tracks how many devices registered per IP
 # Premium users are always exempt from this limit.
 MAX_DEVICES_PER_IP = 2
 
-import ipaddress
-
-# IP prefixes that can NEVER be real end-user public IPs:
-#   100.64.0.0/10  — RFC 6598 Carrier-Grade NAT (Railway / Fly.io internal)
-#   10.0.0.0/8     — RFC 1918 private
-#   172.16.0.0/12  — RFC 1918 private
-#   192.168.0.0/16 — RFC 1918 private
-#   127.0.0.0/8    — loopback
-_UNROUTABLE_NETS = [
-    ipaddress.ip_network("100.64.0.0/10"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("127.0.0.0/8"),
-]
-
-
-def _is_unroutable(ip: str) -> bool:
-    try:
-        return any(ipaddress.ip_address(ip) in net for net in _UNROUTABLE_NETS)
-    except ValueError:
-        return False
-
-
-def get_real_ip(request: Request) -> str:
-    """
-    Return the genuine client IP.
-
-    Railway sets X-Forwarded-For: <real-ip>, <proxy1>, …
-    We walk left-to-right and take the first non-private address.
-    Falls back to the socket IP for local dev.
-    """
-    xff = request.headers.get("X-Forwarded-For", "")
-    if xff:
-        for candidate in xff.split(","):
-            candidate = candidate.strip()
-            if candidate and not _is_unroutable(candidate):
-                return candidate
-    direct = request.client.host if request.client else "unknown"
-    return direct
-
-
 # Channel Link Manager scheduler handle
 channel_scheduler = None  # initialized on startup
 # --- Models ---
@@ -1578,42 +1536,31 @@ async def register_device(payload: dict, request: Request):
 
     if not device:
         # ── NEW DEVICE: apply IP guard before creating the record ──────────
-        client_ip = get_real_ip(request)
+        client_ip = request.client.host if request.client else "unknown"
 
-        # If the resolved IP is still an unroutable/proxy address (e.g. pure
-        # local dev with no X-Forwarded-For), skip the guard entirely — we
-        # cannot do meaningful per-IP limiting without a real public IP.
-        if _is_unroutable(client_ip) or client_ip == "unknown":
-            logger.info(
-                f"ℹ️ IP guard skipped for {uuid_}: "
-                f"unroutable/proxy IP {client_ip!r} — cannot identify real user"
+        # Count how many *distinct non-premium* devices are already registered from this IP.
+        # Premium devices are excluded so that a premium user's home/office IP does not
+        # block other family members from registering free devices.
+        non_premium_uuids_on_ip = await ip_guard_col.distinct("uuid", {"ip": client_ip})
+        premium_on_ip = await devices_col.count_documents({
+            "uuid": {"$in": non_premium_uuids_on_ip},
+            "isPremium": True
+        })
+        existing_count = max(0, len(non_premium_uuids_on_ip) - premium_on_ip)
+
+        if existing_count >= MAX_DEVICES_PER_IP:
+            logger.warning(
+                f"🚫 IP guard blocked new device {uuid_} from {client_ip} "
+                f"({existing_count} devices already registered)"
             )
-            client_ip = None  # sentinel: skip guard + skip recording
-
-        if client_ip:
-            # Count how many *distinct non-premium* devices are already registered from this IP.
-            # Premium devices are excluded so that a premium user's home/office IP does not
-            # block other family members from registering free devices.
-            non_premium_uuids_on_ip = await ip_guard_col.distinct("uuid", {"ip": client_ip})
-            premium_on_ip = await devices_col.count_documents({
-                "uuid": {"$in": non_premium_uuids_on_ip},
-                "isPremium": True
-            })
-            existing_count = max(0, len(non_premium_uuids_on_ip) - premium_on_ip)
-
-            if existing_count >= MAX_DEVICES_PER_IP:
-                logger.warning(
-                    f"🚫 IP guard blocked new device {uuid_} from {client_ip} "
-                    f"({existing_count} devices already registered)"
-                )
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        f"Too many devices registered from your network "
-                        f"(max {MAX_DEVICES_PER_IP}). "
-                        "Please contact support if this is a mistake."
-                    ),
-                )
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"Too many devices registered from your network "
+                    f"(max {MAX_DEVICES_PER_IP}). "
+                    "Please contact support if this is a mistake."
+                ),
+            )
 
         flags = await get_admin_flags()
 
@@ -1636,23 +1583,20 @@ async def register_device(payload: dict, request: Request):
         )
 
         # ── Record this IP ↔ UUID mapping (ignore if it already exists) ──
-        if client_ip:
-            try:
-                await ip_guard_col.insert_one(
-                    {"ip": client_ip, "uuid": uuid_, "createdAt": now}
-                )
-            except DuplicateKeyError:
-                pass  # mapping already recorded — not an error
+        try:
+            await ip_guard_col.insert_one(
+                {"ip": client_ip, "uuid": uuid_, "createdAt": now}
+            )
+        except DuplicateKeyError:
+            pass  # mapping already recorded — not an error
 
     else:
         # ── RETURNING DEVICE ─────────────────────────────────────────────
         # Premium users are never blocked; just touch lastSeen and return.
         is_premium = device.get("isPremium", False)
-        client_ip = get_real_ip(request)
-        if _is_unroutable(client_ip) or client_ip == "unknown":
-            client_ip = None
+        client_ip = request.client.host if request.client else "unknown"
 
-        if not is_premium and client_ip:
+        if not is_premium:
             # Ensure the ip_guard record exists for this device (backfill for
             # devices that registered before ip_guard was introduced).
             try:
@@ -3933,169 +3877,6 @@ async def admin_payments(
         ],
         "duration_stats": stats_map
     }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 🏷️  ADMIN: CHANNEL ALIASES CRUD
-# ══════════════════════════════════════════════════════════════════════════════
-
-from bson import ObjectId
-
-
-class AliasCreate(BaseModel):
-    animalName: str
-    channelId: str
-    description: Optional[str] = None
-    isActive: bool = True
-
-
-class AliasUpdate(BaseModel):
-    isActive: Optional[bool] = None
-    description: Optional[str] = None
-
-
-def _serialize_alias(doc: dict) -> dict:
-    raw_id = doc.get("_id")
-    id_str = str(raw_id) if raw_id is not None else ""
-    alias_str = doc.get("alias", "")
-    animal_name = doc.get("animalName") or alias_str.split(".")[0]
-    created = doc.get("createdAt")
-    updated = doc.get("updatedAt")
-    return {
-        "id":          id_str,
-        "_id":         id_str,
-        "alias":       alias_str,
-        "animalName":  animal_name,
-        "channelId":   str(doc.get("channelId", "")),
-        "channelName": doc.get("channelName"),
-        "description": doc.get("description"),
-        "isActive":    bool(doc.get("isActive", True)),
-        "createdAt":   created.isoformat() if created and hasattr(created, "isoformat") else created,
-        "updatedAt":   updated.isoformat() if updated and hasattr(updated, "isoformat") else updated,
-    }
-
-
-@app.get("/admin/aliases")
-async def admin_list_aliases(admin: dict = Depends(get_current_admin)):
-    """Returns { "aliases": [...] } — shape aliases_provider.dart expects."""
-    docs = await db.channel_aliases.find({}).sort("alias", 1).to_list(None)
-    return {"aliases": [_serialize_alias(d) for d in docs]}
-
-
-@app.post("/admin/aliases", status_code=201)
-async def admin_create_alias(body: AliasCreate, admin: dict = Depends(get_current_admin)):
-    alias_key = _normalize_alias(body.animalName)
-    if not alias_key:
-        raise HTTPException(400, "animalName must not be empty")
-    if await db.channel_aliases.find_one({"alias": alias_key}):
-        raise HTTPException(409, f"Alias '{alias_key}' already exists")
-    try:
-        channel_id_val = int(body.channelId)
-    except (ValueError, TypeError):
-        channel_id_val = body.channelId
-    now = datetime.utcnow()
-    doc = {
-        "alias": alias_key, "animalName": alias_key,
-        "channelId": channel_id_val, "description": body.description,
-        "isActive": body.isActive, "createdAt": now, "updatedAt": now,
-    }
-    result = await db.channel_aliases.insert_one(doc)
-    doc["_id"] = result.inserted_id
-    return _serialize_alias(doc)
-
-
-@app.put("/admin/aliases/{alias_id}")
-async def admin_update_alias(alias_id: str, body: AliasUpdate, admin: dict = Depends(get_current_admin)):
-    try:
-        oid = ObjectId(alias_id)
-    except Exception:
-        raise HTTPException(400, f"Invalid alias id: {alias_id}")
-    if not await db.channel_aliases.find_one({"_id": oid}):
-        raise HTTPException(404, f"Alias '{alias_id}' not found")
-    updates: dict = {"updatedAt": datetime.utcnow()}
-    if body.isActive is not None:
-        updates["isActive"] = body.isActive
-    if body.description is not None:
-        updates["description"] = body.description
-    await db.channel_aliases.update_one({"_id": oid}, {"$set": updates})
-    return _serialize_alias(await db.channel_aliases.find_one({"_id": oid}))
-
-
-@app.delete("/admin/aliases/{alias_id}", status_code=200)
-async def admin_delete_alias(alias_id: str, admin: dict = Depends(get_current_admin)):
-    try:
-        oid = ObjectId(alias_id)
-    except Exception:
-        raise HTTPException(400, f"Invalid alias id: {alias_id}")
-    if (await db.channel_aliases.delete_one({"_id": oid})).deleted_count == 0:
-        raise HTTPException(404, f"Alias '{alias_id}' not found")
-    return {"deleted": alias_id}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 🛡️  ADMIN: IP REGISTRY
-# ══════════════════════════════════════════════════════════════════════════════
-
-class IpActionBody(BaseModel):
-    ip: str
-
-
-@app.get("/admin/ip-registry")
-async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
-    docs = await ip_guard_col.find({}).sort("ip", 1).to_list(None)
-    grouped: dict = {}
-    for doc in docs:
-        ip = doc.get("ip", "unknown")
-        if ip not in grouped:
-            grouped[ip] = {"ip": ip, "uuids": [], "blocked": False, "count": 0, "createdAt": doc.get("createdAt")}
-        if doc.get("uuid") and doc.get("uuid") != "__blocked__":
-            grouped[ip]["uuids"].append(doc.get("uuid"))
-        grouped[ip]["count"] += 1
-        if doc.get("blocked"):
-            grouped[ip]["blocked"] = True
-        ts = doc.get("createdAt")
-        if ts and grouped[ip]["createdAt"] and ts < grouped[ip]["createdAt"]:
-            grouped[ip]["createdAt"] = ts
-    result = []
-    for e in grouped.values():
-        c = e["createdAt"]
-        e["createdAt"] = c.isoformat() if c and hasattr(c, "isoformat") else c
-        result.append(e)
-    return result
-
-
-@app.post("/admin/ip-registry/block")
-async def admin_block_ip(body: IpActionBody, admin: dict = Depends(get_current_admin)):
-    ip = (body.ip or "").strip()
-    if not ip:
-        raise HTTPException(400, "ip is required")
-    result = await ip_guard_col.update_many({"ip": ip}, {"$set": {"blocked": True, "blockedAt": datetime.utcnow()}})
-    if result.matched_count == 0:
-        await ip_guard_col.update_one(
-            {"ip": ip, "uuid": "__blocked__"},
-            {"$set": {"ip": ip, "uuid": "__blocked__", "blocked": True, "blockedAt": datetime.utcnow(), "createdAt": datetime.utcnow()}},
-            upsert=True,
-        )
-    return {"blocked": ip, "records_updated": result.modified_count}
-
-
-@app.post("/admin/ip-registry/unblock")
-async def admin_unblock_ip(body: IpActionBody, admin: dict = Depends(get_current_admin)):
-    ip = (body.ip or "").strip()
-    if not ip:
-        raise HTTPException(400, "ip is required")
-    result = await ip_guard_col.update_many({"ip": ip}, {"$unset": {"blocked": "", "blockedAt": ""}})
-    await ip_guard_col.delete_many({"ip": ip, "uuid": "__blocked__"})
-    return {"unblocked": ip, "records_updated": result.modified_count}
-
-
-@app.delete("/admin/ip-registry/{ip:path}")
-async def admin_delete_ip_records(ip: str, admin: dict = Depends(get_current_admin)):
-    ip = urllib.parse.unquote(ip).strip()
-    if not ip:
-        raise HTTPException(400, "ip is required")
-    result = await ip_guard_col.delete_many({"ip": ip})
-    return {"deleted_ip": ip, "records_deleted": result.deleted_count}
 
 
 if __name__ == "__main__":
