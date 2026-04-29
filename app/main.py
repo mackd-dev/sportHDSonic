@@ -3879,6 +3879,216 @@ async def admin_payments(
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# 🏷️  ADMIN: CHANNEL ALIASES CRUD
+# Flutter calls:  GET /admin/aliases
+#                 POST /admin/aliases
+#                 PUT  /admin/aliases/{alias}
+#                 DELETE /admin/aliases/{alias}
+# ══════════════════════════════════════════════════════════════════════════════
+
+class AliasCreate(BaseModel):
+    alias: str
+    channelId: int
+    isActive: bool = True
+
+class AliasUpdate(BaseModel):
+    channelId: Optional[int] = None
+    isActive: Optional[bool] = None
+
+
+def _serialize_alias(doc: dict) -> dict:
+    """Strip MongoDB _id and normalise fields for JSON."""
+    return {
+        "alias":     doc.get("alias"),
+        "channelId": doc.get("channelId"),
+        "isActive":  doc.get("isActive", True),
+        "createdAt": doc["createdAt"].isoformat() if doc.get("createdAt") and hasattr(doc.get("createdAt"), "isoformat") else doc.get("createdAt"),
+        "updatedAt": doc["updatedAt"].isoformat() if doc.get("updatedAt") and hasattr(doc.get("updatedAt"), "isoformat") else doc.get("updatedAt"),
+    }
+
+
+@app.get("/admin/aliases")
+async def admin_list_aliases(admin: dict = Depends(get_current_admin)):
+    """📋 List all channel aliases."""
+    docs = await db.channel_aliases.find({}).sort("alias", 1).to_list(None)
+    return [_serialize_alias(d) for d in docs]
+
+
+@app.post("/admin/aliases", status_code=201)
+async def admin_create_alias(body: AliasCreate, admin: dict = Depends(get_current_admin)):
+    """➕ Create a new alias mapping."""
+    alias_key = _normalize_alias(body.alias)
+    if not alias_key:
+        raise HTTPException(400, "alias must not be empty")
+
+    existing = await db.channel_aliases.find_one({"alias": alias_key})
+    if existing:
+        raise HTTPException(409, f"Alias '{alias_key}' already exists")
+
+    now = datetime.utcnow()
+    doc = {
+        "alias":     alias_key,
+        "channelId": body.channelId,
+        "isActive":  body.isActive,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    await db.channel_aliases.insert_one(doc)
+    return _serialize_alias(doc)
+
+
+@app.put("/admin/aliases/{alias}")
+async def admin_update_alias(
+    alias: str,
+    body: AliasUpdate,
+    admin: dict = Depends(get_current_admin),
+):
+    """✏️ Update channelId or isActive on an existing alias."""
+    alias_key = _normalize_alias(alias)
+    existing = await db.channel_aliases.find_one({"alias": alias_key})
+    if not existing:
+        raise HTTPException(404, f"Alias '{alias_key}' not found")
+
+    updates: dict = {"updatedAt": datetime.utcnow()}
+    if body.channelId is not None:
+        updates["channelId"] = body.channelId
+    if body.isActive is not None:
+        updates["isActive"] = body.isActive
+
+    await db.channel_aliases.update_one({"alias": alias_key}, {"$set": updates})
+    updated = await db.channel_aliases.find_one({"alias": alias_key})
+    return _serialize_alias(updated)
+
+
+@app.delete("/admin/aliases/{alias}", status_code=200)
+async def admin_delete_alias(alias: str, admin: dict = Depends(get_current_admin)):
+    """🗑️ Delete an alias."""
+    alias_key = _normalize_alias(alias)
+    result = await db.channel_aliases.delete_one({"alias": alias_key})
+    if result.deleted_count == 0:
+        raise HTTPException(404, f"Alias '{alias_key}' not found")
+    return {"deleted": alias_key}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🛡️  ADMIN: IP REGISTRY (IP Guard management)
+# Flutter calls:  GET    /admin/ip-registry
+#                 POST   /admin/ip-registry/block
+#                 POST   /admin/ip-registry/unblock
+#                 DELETE /admin/ip-registry/{ip}
+# ══════════════════════════════════════════════════════════════════════════════
+
+class IpActionBody(BaseModel):
+    ip: str
+
+
+def _serialize_ip_entry(doc: dict) -> dict:
+    return {
+        "ip":        doc.get("ip"),
+        "uuid":      doc.get("uuid"),
+        "blocked":   doc.get("blocked", False),
+        "createdAt": doc["createdAt"].isoformat() if doc.get("createdAt") and hasattr(doc.get("createdAt"), "isoformat") else doc.get("createdAt"),
+    }
+
+
+@app.get("/admin/ip-registry")
+async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
+    """
+    📋 Return all IP-guard records, grouped by IP address.
+
+    Each entry contains:
+      - ip       : the IP address
+      - uuids    : list of device UUIDs registered from that IP
+      - blocked  : whether the IP is manually blocked
+      - count    : number of distinct UUIDs
+      - createdAt: earliest registration timestamp
+    """
+    docs = await ip_guard_col.find({}).sort("ip", 1).to_list(None)
+
+    # Group by IP
+    grouped: dict[str, dict] = {}
+    for doc in docs:
+        ip = doc.get("ip", "unknown")
+        if ip not in grouped:
+            grouped[ip] = {
+                "ip":       ip,
+                "uuids":    [],
+                "blocked":  doc.get("blocked", False),
+                "count":    0,
+                "createdAt": doc.get("createdAt"),
+            }
+        grouped[ip]["uuids"].append(doc.get("uuid"))
+        grouped[ip]["count"] += 1
+        # blocked=True wins if ANY record for this IP is blocked
+        if doc.get("blocked"):
+            grouped[ip]["blocked"] = True
+        # keep the earliest createdAt
+        entry_ts = doc.get("createdAt")
+        if entry_ts and grouped[ip]["createdAt"] and entry_ts < grouped[ip]["createdAt"]:
+            grouped[ip]["createdAt"] = entry_ts
+
+    result = []
+    for entry in grouped.values():
+        created = entry["createdAt"]
+        entry["createdAt"] = created.isoformat() if created and hasattr(created, "isoformat") else created
+        result.append(entry)
+
+    return result
+
+
+@app.post("/admin/ip-registry/block")
+async def admin_block_ip(body: IpActionBody, admin: dict = Depends(get_current_admin)):
+    """🚫 Manually block all devices from an IP address."""
+    ip = (body.ip or "").strip()
+    if not ip:
+        raise HTTPException(400, "ip is required")
+
+    result = await ip_guard_col.update_many(
+        {"ip": ip},
+        {"$set": {"blocked": True, "blockedAt": datetime.utcnow()}},
+    )
+    # If the IP had no records yet, insert a sentinel block entry so future
+    # registrations from this IP are still denied.
+    if result.matched_count == 0:
+        await ip_guard_col.update_one(
+            {"ip": ip, "uuid": "__blocked__"},
+            {"$set": {"ip": ip, "uuid": "__blocked__", "blocked": True, "blockedAt": datetime.utcnow(), "createdAt": datetime.utcnow()}},
+            upsert=True,
+        )
+    logger.info(f"🚫 Admin blocked IP {ip} ({result.modified_count} records updated)")
+    return {"blocked": ip, "records_updated": result.modified_count}
+
+
+@app.post("/admin/ip-registry/unblock")
+async def admin_unblock_ip(body: IpActionBody, admin: dict = Depends(get_current_admin)):
+    """✅ Remove a manual block from an IP address."""
+    ip = (body.ip or "").strip()
+    if not ip:
+        raise HTTPException(400, "ip is required")
+
+    result = await ip_guard_col.update_many(
+        {"ip": ip},
+        {"$unset": {"blocked": "", "blockedAt": ""}},
+    )
+    # Remove sentinel block entry if present
+    await ip_guard_col.delete_many({"ip": ip, "uuid": "__blocked__"})
+    logger.info(f"✅ Admin unblocked IP {ip} ({result.modified_count} records updated)")
+    return {"unblocked": ip, "records_updated": result.modified_count}
+
+
+@app.delete("/admin/ip-registry/{ip:path}")
+async def admin_delete_ip_records(ip: str, admin: dict = Depends(get_current_admin)):
+    """🗑️ Delete ALL ip_guard records for the given IP (frees up the slot)."""
+    ip = urllib.parse.unquote(ip).strip()
+    if not ip:
+        raise HTTPException(400, "ip is required")
+
+    result = await ip_guard_col.delete_many({"ip": ip})
+    logger.info(f"🗑️ Admin deleted {result.deleted_count} ip_guard records for {ip}")
+    return {"deleted_ip": ip, "records_deleted": result.deleted_count}
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
