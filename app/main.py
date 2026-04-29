@@ -3881,94 +3881,145 @@ async def admin_payments(
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 🏷️  ADMIN: CHANNEL ALIASES CRUD
-# Flutter calls:  GET /admin/aliases
-#                 POST /admin/aliases
-#                 PUT  /admin/aliases/{alias}
-#                 DELETE /admin/aliases/{alias}
+#
+# Flutter contract (aliases_provider.dart):
+#   GET    /admin/aliases           → { "aliases": [ AliasItem, … ] }
+#   POST   /admin/aliases           → body: { animalName, channelId, description? }
+#   PUT    /admin/aliases/{id}      → id = Mongo _id string; body: { isActive?, description? }
+#   DELETE /admin/aliases/{id}      → id = Mongo _id string
 # ══════════════════════════════════════════════════════════════════════════════
 
+from bson import ObjectId
+
+
 class AliasCreate(BaseModel):
-    alias: str
-    channelId: int
+    # Flutter sends animalName (e.g. "paka"), not a full alias string
+    animalName: str
+    channelId: str          # Flutter sends a string from TextEditingController
+    description: Optional[str] = None
     isActive: bool = True
 
+
 class AliasUpdate(BaseModel):
-    channelId: Optional[int] = None
     isActive: Optional[bool] = None
+    description: Optional[str] = None
 
 
 def _serialize_alias(doc: dict) -> dict:
-    """Strip MongoDB _id and normalise fields for JSON."""
+    """Serialise a channel_aliases Mongo doc to the shape Flutter expects."""
+    raw_id = doc.get("_id")
+    id_str = str(raw_id) if raw_id is not None else ""
+
+    alias_str = doc.get("alias", "")
+    # animalName is the part before the first dot (or the whole string)
+    animal_name = doc.get("animalName") or alias_str.split(".")[0]
+
+    created = doc.get("createdAt")
+    updated = doc.get("updatedAt")
+
     return {
-        "alias":     doc.get("alias"),
-        "channelId": doc.get("channelId"),
-        "isActive":  doc.get("isActive", True),
-        "createdAt": doc["createdAt"].isoformat() if doc.get("createdAt") and hasattr(doc.get("createdAt"), "isoformat") else doc.get("createdAt"),
-        "updatedAt": doc["updatedAt"].isoformat() if doc.get("updatedAt") and hasattr(doc.get("updatedAt"), "isoformat") else doc.get("updatedAt"),
+        "id":          id_str,          # Flutter uses this for PUT / DELETE
+        "_id":         id_str,          # belt-and-suspenders
+        "alias":       alias_str,
+        "animalName":  animal_name,
+        "channelId":   str(doc.get("channelId", "")),
+        "channelName": doc.get("channelName"),
+        "description": doc.get("description"),
+        "isActive":    bool(doc.get("isActive", True)),
+        "createdAt":   created.isoformat() if created and hasattr(created, "isoformat") else created,
+        "updatedAt":   updated.isoformat() if updated and hasattr(updated, "isoformat") else updated,
     }
 
 
 @app.get("/admin/aliases")
 async def admin_list_aliases(admin: dict = Depends(get_current_admin)):
-    """📋 List all channel aliases."""
+    """
+    📋 List all channel aliases.
+    Returns { "aliases": [...] } — the shape aliases_provider.dart expects.
+    """
     docs = await db.channel_aliases.find({}).sort("alias", 1).to_list(None)
-    return [_serialize_alias(d) for d in docs]
+    return {"aliases": [_serialize_alias(d) for d in docs]}
 
 
 @app.post("/admin/aliases", status_code=201)
 async def admin_create_alias(body: AliasCreate, admin: dict = Depends(get_current_admin)):
-    """➕ Create a new alias mapping."""
-    alias_key = _normalize_alias(body.alias)
+    """
+    ➕ Create a new alias mapping.
+    Flutter sends { animalName, channelId, description? }.
+    We store animalName as the alias key (exact match used by resolve_alias_to_stream).
+    """
+    alias_key = _normalize_alias(body.animalName)
     if not alias_key:
-        raise HTTPException(400, "alias must not be empty")
+        raise HTTPException(400, "animalName must not be empty")
 
     existing = await db.channel_aliases.find_one({"alias": alias_key})
     if existing:
         raise HTTPException(409, f"Alias '{alias_key}' already exists")
 
+    # Try to coerce channelId to int (scraper stores it as int)
+    try:
+        channel_id_val = int(body.channelId)
+    except (ValueError, TypeError):
+        channel_id_val = body.channelId   # keep as string if not numeric
+
     now = datetime.utcnow()
     doc = {
-        "alias":     alias_key,
-        "channelId": body.channelId,
-        "isActive":  body.isActive,
-        "createdAt": now,
-        "updatedAt": now,
+        "alias":       alias_key,
+        "animalName":  alias_key,         # store explicitly for round-trip
+        "channelId":   channel_id_val,
+        "description": body.description,
+        "isActive":    body.isActive,
+        "createdAt":   now,
+        "updatedAt":   now,
     }
-    await db.channel_aliases.insert_one(doc)
+    result = await db.channel_aliases.insert_one(doc)
+    doc["_id"] = result.inserted_id
     return _serialize_alias(doc)
 
 
-@app.put("/admin/aliases/{alias}")
+@app.put("/admin/aliases/{alias_id}")
 async def admin_update_alias(
-    alias: str,
+    alias_id: str,
     body: AliasUpdate,
     admin: dict = Depends(get_current_admin),
 ):
-    """✏️ Update channelId or isActive on an existing alias."""
-    alias_key = _normalize_alias(alias)
-    existing = await db.channel_aliases.find_one({"alias": alias_key})
+    """
+    ✏️ Update isActive / description by Mongo _id (Flutter passes a.id).
+    """
+    try:
+        oid = ObjectId(alias_id)
+    except Exception:
+        raise HTTPException(400, f"Invalid alias id: {alias_id}")
+
+    existing = await db.channel_aliases.find_one({"_id": oid})
     if not existing:
-        raise HTTPException(404, f"Alias '{alias_key}' not found")
+        raise HTTPException(404, f"Alias '{alias_id}' not found")
 
     updates: dict = {"updatedAt": datetime.utcnow()}
-    if body.channelId is not None:
-        updates["channelId"] = body.channelId
     if body.isActive is not None:
         updates["isActive"] = body.isActive
+    if body.description is not None:
+        updates["description"] = body.description
 
-    await db.channel_aliases.update_one({"alias": alias_key}, {"$set": updates})
-    updated = await db.channel_aliases.find_one({"alias": alias_key})
+    await db.channel_aliases.update_one({"_id": oid}, {"$set": updates})
+    updated = await db.channel_aliases.find_one({"_id": oid})
     return _serialize_alias(updated)
 
 
-@app.delete("/admin/aliases/{alias}", status_code=200)
-async def admin_delete_alias(alias: str, admin: dict = Depends(get_current_admin)):
-    """🗑️ Delete an alias."""
-    alias_key = _normalize_alias(alias)
-    result = await db.channel_aliases.delete_one({"alias": alias_key})
+@app.delete("/admin/aliases/{alias_id}", status_code=200)
+async def admin_delete_alias(alias_id: str, admin: dict = Depends(get_current_admin)):
+    """
+    🗑️ Delete an alias by Mongo _id (Flutter passes a.id).
+    """
+    try:
+        oid = ObjectId(alias_id)
+    except Exception:
+        raise HTTPException(400, f"Invalid alias id: {alias_id}")
+
+    result = await db.channel_aliases.delete_one({"_id": oid})
     if result.deleted_count == 0:
-        raise HTTPException(404, f"Alias '{alias_key}' not found")
-    return {"deleted": alias_key}
+        raise HTTPException(404, f"Alias '{alias_id}' not found")
+    return {"deleted": alias_id}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3984,46 +4035,39 @@ class IpActionBody(BaseModel):
 
 
 def _serialize_ip_entry(doc: dict) -> dict:
+    created = doc.get("createdAt")
     return {
         "ip":        doc.get("ip"),
         "uuid":      doc.get("uuid"),
         "blocked":   doc.get("blocked", False),
-        "createdAt": doc["createdAt"].isoformat() if doc.get("createdAt") and hasattr(doc.get("createdAt"), "isoformat") else doc.get("createdAt"),
+        "createdAt": created.isoformat() if created and hasattr(created, "isoformat") else created,
     }
 
 
 @app.get("/admin/ip-registry")
 async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
     """
-    📋 Return all IP-guard records, grouped by IP address.
-
-    Each entry contains:
-      - ip       : the IP address
-      - uuids    : list of device UUIDs registered from that IP
-      - blocked  : whether the IP is manually blocked
-      - count    : number of distinct UUIDs
-      - createdAt: earliest registration timestamp
+    📋 Return all IP-guard records grouped by IP address.
+    Each entry: { ip, uuids[], count, blocked, createdAt }
     """
     docs = await ip_guard_col.find({}).sort("ip", 1).to_list(None)
 
-    # Group by IP
-    grouped: dict[str, dict] = {}
+    grouped: dict = {}
     for doc in docs:
         ip = doc.get("ip", "unknown")
         if ip not in grouped:
             grouped[ip] = {
                 "ip":       ip,
                 "uuids":    [],
-                "blocked":  doc.get("blocked", False),
+                "blocked":  False,
                 "count":    0,
                 "createdAt": doc.get("createdAt"),
             }
-        grouped[ip]["uuids"].append(doc.get("uuid"))
+        if doc.get("uuid") and doc.get("uuid") != "__blocked__":
+            grouped[ip]["uuids"].append(doc.get("uuid"))
         grouped[ip]["count"] += 1
-        # blocked=True wins if ANY record for this IP is blocked
         if doc.get("blocked"):
             grouped[ip]["blocked"] = True
-        # keep the earliest createdAt
         entry_ts = doc.get("createdAt")
         if entry_ts and grouped[ip]["createdAt"] and entry_ts < grouped[ip]["createdAt"]:
             grouped[ip]["createdAt"] = entry_ts
@@ -4048,12 +4092,12 @@ async def admin_block_ip(body: IpActionBody, admin: dict = Depends(get_current_a
         {"ip": ip},
         {"$set": {"blocked": True, "blockedAt": datetime.utcnow()}},
     )
-    # If the IP had no records yet, insert a sentinel block entry so future
-    # registrations from this IP are still denied.
     if result.matched_count == 0:
+        # No existing records — insert a sentinel so future registrations are blocked
         await ip_guard_col.update_one(
             {"ip": ip, "uuid": "__blocked__"},
-            {"$set": {"ip": ip, "uuid": "__blocked__", "blocked": True, "blockedAt": datetime.utcnow(), "createdAt": datetime.utcnow()}},
+            {"$set": {"ip": ip, "uuid": "__blocked__", "blocked": True,
+                      "blockedAt": datetime.utcnow(), "createdAt": datetime.utcnow()}},
             upsert=True,
         )
     logger.info(f"🚫 Admin blocked IP {ip} ({result.modified_count} records updated)")
@@ -4071,7 +4115,6 @@ async def admin_unblock_ip(body: IpActionBody, admin: dict = Depends(get_current
         {"ip": ip},
         {"$unset": {"blocked": "", "blockedAt": ""}},
     )
-    # Remove sentinel block entry if present
     await ip_guard_col.delete_many({"ip": ip, "uuid": "__blocked__"})
     logger.info(f"✅ Admin unblocked IP {ip} ({result.modified_count} records updated)")
     return {"unblocked": ip, "records_updated": result.modified_count}
@@ -4079,7 +4122,7 @@ async def admin_unblock_ip(body: IpActionBody, admin: dict = Depends(get_current
 
 @app.delete("/admin/ip-registry/{ip:path}")
 async def admin_delete_ip_records(ip: str, admin: dict = Depends(get_current_admin)):
-    """🗑️ Delete ALL ip_guard records for the given IP (frees up the slot)."""
+    """🗑️ Delete ALL ip_guard records for the given IP (frees up the device slot)."""
     ip = urllib.parse.unquote(ip).strip()
     if not ip:
         raise HTTPException(400, "ip is required")
