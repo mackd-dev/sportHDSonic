@@ -1471,7 +1471,6 @@ _SIG_EXEMPT_PREFIXES = (
     "/webhooks",
     "/payway/webhooks",    # PayWay-branded webhook aliases
     "/payment-webhook",
-    "/device/register",    # Bootstrap endpoint — app has no token yet at registration
     "/api/schedules",
     "/api/vipindi",
     "/api/channels",      # admin panel still uses this legacy path
@@ -1529,15 +1528,15 @@ class AppIdentityMiddleware(BaseHTTPMiddleware):
         # /device/register only needs X-DEVICE-ID (no Bearer yet at registration)
         is_bootstrap = path in {"/device/register"}
 
-        # 1. X-Client-Sig — enforce if APP_CLIENT_SECRET is configured
+        # 1. X-Client-Sig — log only, NOT enforced (app does not send this header yet)
         if APP_CLIENT_SECRET:
             sig = request.headers.get("x-client-sig", "")
             if not sig or not hmac.compare_digest(sig, APP_CLIENT_SECRET):
-                logger.warning(
-                    f"🚫 Blocked — bad X-Client-Sig | path={path} ip={client_ip} "
+                logger.info(
+                    f"ℹ️ X-Client-Sig mismatch (not enforced) | path={path} ip={client_ip} "
                     f"ua={request.headers.get('user-agent', '')[:60]}"
                 )
-                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+                # NOTE: Not blocking — re-enable once app sends X-Client-Sig header
 
         # 2. X-DEVICE-ID — required on all app routes
         device_id = request.headers.get("x-device-id", "")
