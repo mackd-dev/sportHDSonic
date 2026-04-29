@@ -3910,3 +3910,17 @@ async def admin_payments(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
+
+@app.get("/admin/ip-registry")
+async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
+    """Admin endpoint to view all IP guard entries."""
+    ip_entries = await ip_guard_col.find().to_list(None)
+    return [serialize_doc(entry, for_admin=True) for entry in ip_entries]
+
+@app.get("/admin/payment-provider")
+async def admin_payment_provider(admin: dict = Depends(get_current_admin)):
+    """Admin endpoint for payment provider configuration (placeholder)."""
+    # This is a placeholder. Actual implementation would involve fetching/updating
+    # payment provider configurations from a dedicated collection.
+    return {"message": "Payment provider configuration endpoint. Implementation pending."}
