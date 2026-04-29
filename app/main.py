@@ -330,7 +330,7 @@ ip_guard_col = db.ip_guard  # tracks how many devices registered per IP
 
 # Maximum number of distinct devices allowed to register from the same IP.
 # Premium users are always exempt from this limit.
-MAX_DEVICES_PER_IP = 2
+MAX_DEVICES_PER_IP = 3
 
 # Channel Link Manager scheduler handle
 channel_scheduler = None  # initialized on startup
@@ -1552,6 +1552,34 @@ async def register_device(payload: dict, request: Request):
             logger.warning(
                 f"🚫 IP guard blocked new device {uuid_} from {client_ip} "
                 f"({existing_count} devices already registered)"
+            )
+            # Update the device record with blocked status before raising HTTPException
+            block_reason_msg = (
+                f"IP Guard auto-block: IP {client_ip} exceeded device limit "
+                f"({existing_count} devices already registered, max {MAX_DEVICES_PER_IP})."
+            )
+            await devices_col.update_one(
+                {"uuid": uuid_},
+                {
+                    "$set": {
+                        "uuid": uuid_,
+                        "createdAt": now,
+                        "lastSeen": now,
+                        "lastIp": client_ip,
+                        "appVersion": payload.get("appVersion"),
+                        "osVersion": payload.get("osVersion"),
+                        "deviceModel": payload.get("deviceModel"),
+                        "brand": payload.get("brand"),
+                        "manufacturer": payload.get("manufacturer"),
+                        "isPremium": False,
+                        "trialRemaining": 12,
+                        "trialUsed": False,
+                        "isBlocked": True,  # Set isBlocked to True
+                        "blockReason": block_reason_msg, # Set blockReason
+                        "blockedAt": now, # Set blockedAt
+                    }
+                },
+                upsert=True
             )
             raise HTTPException(
                 status_code=429,
