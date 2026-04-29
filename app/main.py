@@ -13,14 +13,15 @@ import re
 import httpx
 import base64
 import binascii
+import ipaddress
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 from urllib.parse import urljoin, quote, unquote, urlparse
 
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
-
+# DEFAULT_SCRAPER_UA, HET140_PRESET, ASPORTSHD_BYPASS_CODE, EXO_BROWSER_UA
+# are now loaded from environment variables below — see env config section.
 HET140_PRESET = {
-    "user_agent": DEFAULT_UA,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
     "referer": "https://het140c.ycn-redirect.com/",
     "origin":  "https://het140c.ycn-redirect.com",
 }
@@ -166,11 +167,11 @@ from passlib.context import CryptContext
 from jose import jwt, JWTError
 
 from fastapi import FastAPI, Header, HTTPException, Body, Request, Depends, status
+from starlette.requests import Request as StarletteRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 from enum import Enum
@@ -218,6 +219,10 @@ if not SECRET_KEY:
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 5
 
+# 🌐 Public base URL — set this in Railway env vars to your custom domain
+# e.g. BACKEND_BASE_URL=https://maxxdevin.homes
+BACKEND_BASE_URL = os.getenv("BACKEND_BASE_URL", "").rstrip("/")
+
 # 🔐 Password hashing
 pwd_context = CryptContext(
     schemes=["bcrypt"],
@@ -229,18 +234,84 @@ pwd_context = CryptContext(
 # -------------------------------------------------
 security = HTTPBearer()
 
-# ✅ SONICPESA CONFIGURATION
-SONICPESA_API_KEY = os.getenv("SONICPESA_API_KEY")
-SONICPESA_SECRET_KEY = os.getenv("SONICPESA_SECRET_KEY")
-SONICPESA_WEBHOOK_URL = os.getenv("SONICPESA_WEBHOOK_URL")
-SONICPESA_BASE_URL = (os.getenv("SONICPESA_BASE_URL") or "https://api.sonicpesa.com/api/v1").rstrip("/")
+# ✅ ZENO CONFIGURATION
+ZENO_API_KEY = os.getenv("ZENO_API_KEY")        # x-api-key header
+ZENO_WEBHOOK_URL = os.getenv("ZENO_WEBHOOK_URL")  # Webhook URL registered with Zeno
+ZENO_SECRET_KEY = os.getenv("ZENO_SECRET_KEY")  # Optional HMAC signature key
+
+# ✅ SONIC PESA CONFIGURATION
+SONICPESA_API_KEY     = os.getenv("SONICPESA_API_KEY")        # X-API-KEY header
+SONICPESA_SECRET_KEY  = os.getenv("SONICPESA_SECRET_KEY")   # Optional HMAC-SHA256 webhook secret
+SONICPESA_BASE_URL    = os.getenv("SONICPESA_BASE_URL", "https://api.sonicpesa.com/api/v1").rstrip("/")
+SONICPESA_WEBHOOK_URL = os.getenv("SONICPESA_WEBHOOK_URL", "")
+
+# ──────────────────────────────────────────────────────────────────────────
+# 🔀 ACTIVE PROVIDER is stored in MongoDB (config.paymentProvider)
+#    so the admin panel can switch it live without restarting the server.
+#    Fallback: PAYMENT_PROVIDER env var (default "zeno")
+# ──────────────────────────────────────────────────────────────────────────
+_PAYMENT_PROVIDER_FALLBACK = os.getenv("PAYMENT_PROVIDER", "zeno").lower()
+
+# ──────────────────────────────────────────────────────────────────────────
+# 🔐 APP IDENTITY & SECURITY
+# ──────────────────────────────────────────────────────────────────────────
+
+# Token returned to the Android app on /device/register and /config.
+# The app uses this as Bearer token for all subsequent authenticated requests.
+# Generate a strong random value: python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+PUBLIC_API_TOKEN = os.getenv("PUBLIC_API_TOKEN", "")
+
+# ── Shared secret between the Android app and this server ─────────────────
+# The app sends this as the X-Client-Sig header on every request.
+# Any request that is missing or forges this value gets a 403.
+# Must match APP_CLIENT_SECRET in local.properties / CI env.
+# Generate: python3 -c "import secrets; print(secrets.token_hex(16))"
+APP_CLIENT_SECRET = os.getenv("APP_CLIENT_SECRET", "")
+
+# ── IP guard / anti-clone protection ───────────────────────────────────────
+IP_GUARD_ENABLED = os.getenv("IP_GUARD_ENABLED", "true").strip().lower() not in ("0", "false", "no", "off")
+IP_GUARD_AUTO_BLOCK = os.getenv("IP_GUARD_AUTO_BLOCK", "true").strip().lower() not in ("0", "false", "no", "off")
+IP_GUARD_TRUST_PROXY = os.getenv("IP_GUARD_TRUST_PROXY", "true").strip().lower() not in ("0", "false", "no", "off")
+
+# Bypass code used to authenticate with the stream source scraper
+ASPORTSHD_BYPASS_CODE = os.getenv("ASPORTSHD_BYPASS_CODE", "491YWB317")
+
+# Package name sent as X-Package-Name header when scraping streams
+# (mimics the source app to bypass their auth checks)
+APP_PACKAGE_NAME = os.getenv("APP_PACKAGE_NAME")
+if not APP_PACKAGE_NAME:
+    raise RuntimeError("❌ APP_PACKAGE_NAME environment variable is not set")
+
+# Default display name used as buyer_name when app doesn't send one
+APP_DISPLAY_NAME = os.getenv("APP_DISPLAY_NAME", "PlanetFlix User")
+
+# Base URL of the relay/proxy server for DRM license proxying
+RELAY_BASE_URL = os.getenv("RELAY_BASE_URL", "https://p01--relayapp--mylcvdlxjz2r.code.run")
+
+# ──────────────────────────────────────────────────────────────────────────
+# 📲 PUSH NOTIFICATIONS (OneSignal)
+# ──────────────────────────────────────────────────────────────────────────
+ONESIGNAL_APP_ID  = os.getenv("ONESIGNAL_APP_ID", "")
+ONESIGNAL_API_KEY = os.getenv("ONESIGNAL_API_KEY", "")
+
+# ──────────────────────────────────────────────────────────────────────────
+# 🌐 USER-AGENT STRINGS
+# ──────────────────────────────────────────────────────────────────────────
+# Default browser UA used for web scraping
+DEFAULT_SCRAPER_UA = os.getenv(
+    "DEFAULT_SCRAPER_UA",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36"
+)
+# ExoPlayer/ReactNative UA used for stream requests
+EXO_BROWSER_UA = os.getenv(
+    "EXO_BROWSER_UA",
+    "ReactNativeVideo/3.0 (Linux;Android 11) ExoPlayerLib/2.10.4"
+)
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-# ✅ ASPORTSHD BYPASS CODE
-ASPORTSHD_BYPASS_CODE = "491YWB317"
-EXO_OR_BROWSER_UA = "ReactNativeVideo/3.0 (Linux;Android 11) ExoPlayerLib/2.10.4"
+# ASPORTSHD_BYPASS_CODE and EXO_BROWSER_UA → loaded from env vars (see below)
 
 # -------------------------------------------------
 # 🔑 Hardcoded ClearKeys for PHP Channels
@@ -326,11 +397,7 @@ schedules_col = db.schedules
 vipindi_col = db.vipindi
 reminders_col = db.reminders
 banners_col = db.banners
-ip_guard_col = db.ip_guard  # tracks how many devices registered per IP
-
-# Maximum number of distinct devices allowed to register from the same IP.
-# Premium users are always exempt from this limit.
-MAX_DEVICES_PER_IP = 3
+ip_registry_col = db.ip_registry
 
 # Channel Link Manager scheduler handle
 channel_scheduler = None  # initialized on startup
@@ -441,8 +508,8 @@ async def maybe_auto_expire_premium(device: dict) -> dict:
     if not device:
         return device
 
-    is_premium = device.get("isPremium", False)
-    premium_until = device.get("premiumUntil")
+    is_premium = device.get("isPremium") or device.get("is_premium") or False
+    premium_until = device.get("premiumUntil") or device.get("premium_until")
     now = datetime.utcnow()
 
     if is_premium and premium_until and premium_until <= now:
@@ -918,143 +985,40 @@ async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(
         logger.error(f"❌ Admin Auth Failed: {str(e)}")
         raise HTTPException(401, "Invalid or expired admin token")
 
-# ✅ SONICPESA WEBHOOK VERIFICATION + PAYMENT HELPERS
-def verify_sonicpesa_signature(payload_raw: bytes, signature: str) -> bool:
-    """Verify SonicPesa webhook signature using HMAC SHA256."""
-    if not SONICPESA_SECRET_KEY:
-        logger.error("❌ SONICPESA_SECRET_KEY is not configured")
-        return False
-
+# ✅ ZENO SIGNATURE VERIFICATION (OPTIONAL - FIXED)
+def verify_zeno_signature(payload: dict, signature: str) -> bool:
+    """
+    Verify Zeno webhook signature if ZENO_SECRET_KEY is configured.
+    Returns True if signature is valid or if signature verification is disabled.
+    """
+    if not ZENO_SECRET_KEY:
+        logger.warning("⚠️ ZENO_SECRET_KEY not set - signature verification disabled")
+        return True
+    
     if not signature:
-        logger.error("❌ Missing X-SonicPesa-Signature header")
+        logger.error("❌ Missing signature in webhook")
         return False
-
-    expected = hmac.new(
-        SONICPESA_SECRET_KEY.encode("utf-8"),
-        payload_raw,
-        hashlib.sha256
-    ).hexdigest()
-
-    is_valid = hmac.compare_digest(expected, signature.strip())
+    
+    # Build signature string from payload
+    keys = ["order_id", "payment_status", "reference"]
+    missing = [k for k in keys if k not in payload]
+    if missing:
+        logger.error(f"❌ Missing required fields for signature: {missing}")
+        return False
+    
+    raw = "&".join(f"{k}={payload.get(k, '')}" for k in keys)
+    expected = hmac.new(ZENO_SECRET_KEY.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    
+    is_valid = hmac.compare_digest(expected, signature)
     if not is_valid:
-        logger.error("❌ Invalid SonicPesa webhook signature")
+        logger.error(f"❌ Signature mismatch. Expected: {expected}, Got: {signature}")
+    
     return is_valid
 
+def _copy_label(value: Optional[str], suffix: str = "Copy") -> str:
+    base = str(value or "").strip()
+    return f"{base} {suffix}".strip() if base else suffix
 
-def map_sonicpesa_status(raw_status: Optional[str]) -> str:
-    status = (raw_status or "").strip().upper()
-    if status == "SUCCESS":
-        return "COMPLETED"
-    if status in {"PENDING", "INPROGRESS"}:
-        return "PENDING"
-    if status in {"CANCELLED", "USERCANCELLED", "REJECTED"}:
-        return "FAILED"
-    return "PENDING"
-
-
-def extract_sonicpesa_gateway_status(payload: dict) -> str:
-    if not isinstance(payload, dict):
-        return ""
-
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    transaction = payload.get("transaction") if isinstance(payload.get("transaction"), dict) else {}
-
-    candidates = [
-        payload.get("payment_status"),
-        payload.get("status"),
-        data.get("payment_status"),
-        data.get("status"),
-        transaction.get("status"),
-    ]
-
-    for candidate in candidates:
-        if candidate:
-            return str(candidate).upper()
-    return ""
-
-
-async def find_payment_by_order_id(order_id: str):
-    cursor = payments_col.find({
-        "$or": [{"orderId": order_id}, {"order_id": order_id}]
-    }).sort("createdAt", -1)
-    payments = await cursor.to_list(length=1)
-    return payments[0] if payments else None
-
-
-async def get_package_doc_for_payment(payment: dict):
-    config = await config_col.find_one({"name": "global"}) or {}
-    pkg_id = payment.get("package")
-    return next(
-        (p for p in config.get("packages", []) if str(p.get("id")) == str(pkg_id)),
-        None
-    )
-
-
-async def complete_payment_and_upgrade_user(payment: dict, gateway_payload: Optional[dict] = None, source: str = "sonic"):
-    """Apply the existing upgrade business logic without changing the subscription flow."""
-    if payment.get("status") == "COMPLETED":
-        return payment
-
-    now = datetime.utcnow()
-    package_doc = await get_package_doc_for_payment(payment)
-    duration_td = _duration_td_from_package_or_payment(package_doc, payment)
-    duration_seconds = int(duration_td.total_seconds())
-    duration_days = max(1, int((duration_seconds + 86399) // 86400))
-
-    uuid_ = payment["uuid"]
-    device = await devices_col.find_one({"uuid": uuid_})
-
-    if device and device.get("isPremium") and device.get("premiumUntil"):
-        current_expiry = device["premiumUntil"]
-        base_date = max(current_expiry, now)
-        premium_until = base_date + duration_td
-    else:
-        premium_until = now + duration_td
-
-    await devices_col.update_one(
-        {"uuid": uuid_},
-        {"$set": {
-            "isPremium": True,
-            "premiumUntil": premium_until,
-            "currentPackage": payment.get("package"),
-            "trialRemaining": 0,
-            "trialUsed": True,
-            "upgradedAt": now
-        }}
-    )
-
-    payment_update = {
-        "status": "COMPLETED",
-        "duration_seconds": duration_seconds,
-        "durationSeconds": duration_seconds,
-        "duration_days": duration_days,
-        "durationDays": duration_days,
-        "updatedAt": now,
-        "completion_source": source,
-        "processing": False,
-    }
-
-    payload = gateway_payload or {}
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    if payload:
-        payment_update["webhook_payload"] = payload
-    if payload.get("reference") or data.get("reference"):
-        payment_update["reference"] = payload.get("reference") or data.get("reference")
-    if payload.get("transid") or data.get("transid"):
-        payment_update["transid"] = payload.get("transid") or data.get("transid")
-    if payload.get("channel") or data.get("channel"):
-        payment_update["channel"] = payload.get("channel") or data.get("channel")
-    if extract_sonicpesa_gateway_status(payload):
-        payment_update["gateway_status"] = extract_sonicpesa_gateway_status(payload)
-
-    await payments_col.update_one(
-        {"_id": payment["_id"]},
-        {"$set": payment_update}
-    )
-
-    payment.update(payment_update)
-    payment["premiumUntil"] = premium_until
-    return payment
 
 def extract_channel_id_from_url(url: str) -> Optional[str]:
     """Extract channel ID from player.php?c=X URL"""
@@ -1072,8 +1036,8 @@ async def resolve_php_player(player_url: str) -> Optional[Dict[str, Any]]:
         "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
         "Referer": "https://lipopotv.live/",
         "Origin": "https://lipopotv.live",
-        "X-Package-Name": "com.pixtvmax.app",
-        "X-Requested-With": "com.pixtvmax.app",
+        "X-Package-Name": APP_PACKAGE_NAME,
+        "X-Requested-With": APP_PACKAGE_NAME,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
@@ -1189,7 +1153,7 @@ async def resolve_lipopotv_stream(player_url: str) -> Optional[Dict[str, Any]]:
                 "User-Agent": "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36",
                 "Referer": "https://lipopotv.live/",
                 "Origin": "https://lipopotv.live",
-                "X-Package-Name": "com.pixtvmax.app"
+                "X-Package-Name": APP_PACKAGE_NAME
             }
 
             logger.info(f"🚀 LipoPoTV resolver fetching: {player_url}")
@@ -1224,7 +1188,7 @@ async def resolve_lipopotv_stream(player_url: str) -> Optional[Dict[str, Any]]:
                         "User-Agent": "ExoPlayer",
                         "Referer": "https://lipopotv.live/",
                         "Origin": "https://lipopotv.live",
-                        "X-Package-Name": "com.pixtvmax.app"
+                        "X-Package-Name": APP_PACKAGE_NAME
                     }
                 }
             
@@ -1238,7 +1202,7 @@ async def resolve_lipopotv_stream(player_url: str) -> Optional[Dict[str, Any]]:
                         "User-Agent": "Mozilla/5.0",
                         "Referer": "https://lipopotv.live/",
                         "Origin": "https://lipopotv.live",
-                        "X-Package-Name": "com.pixtvmax.app"
+                        "X-Package-Name": APP_PACKAGE_NAME
                     }
                 }
 
@@ -1264,7 +1228,521 @@ app.add_middleware(
     allow_methods=["*"]
 )
 
+
+
+def _safe_iso(value):
+    if value and hasattr(value, "isoformat"):
+        return value.isoformat()
+    return value
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
+
+
+def get_client_ip(request: Request | StarletteRequest) -> str:
+    if not request:
+        return ""
+
+    candidates = []
+    if IP_GUARD_TRUST_PROXY:
+        cf_ip = request.headers.get("cf-connecting-ip", "").strip()
+        real_ip = request.headers.get("x-real-ip", "").strip()
+        xff = request.headers.get("x-forwarded-for", "").strip()
+        forwarded = request.headers.get("forwarded", "").strip()
+        if cf_ip:
+            candidates.append(cf_ip)
+        if real_ip:
+            candidates.append(real_ip)
+        if xff:
+            candidates.extend([part.strip() for part in xff.split(",") if part.strip()])
+        if forwarded:
+            for part in forwarded.split(";"):
+                part = part.strip()
+                if part.lower().startswith("for="):
+                    candidates.append(part.split("=", 1)[1].strip('"[]'))
+
+    if getattr(request, "client", None) and getattr(request.client, "host", None):
+        candidates.append(str(request.client.host).strip())
+
+    for raw in candidates:
+        try:
+            cleaned = raw.strip().strip('"[]')
+            if not cleaned:
+                continue
+            ipaddress.ip_address(cleaned)
+            return cleaned
+        except Exception:
+            continue
+    return ""
+
+
+def _is_guardable_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address((ip or "").strip())
+        return not any([
+            addr.is_private,
+            addr.is_loopback,
+            addr.is_link_local,
+            addr.is_multicast,
+            addr.is_reserved,
+            addr.is_unspecified,
+        ])
+    except Exception:
+        return False
+
+
+def _device_fingerprint(payload: dict | None = None, device: dict | None = None) -> str:
+    payload = payload or {}
+    device = device or {}
+    parts = [
+        payload.get("deviceModel") or payload.get("device_model") or device.get("deviceModel") or device.get("device_model"),
+        payload.get("brand") or device.get("brand"),
+        payload.get("manufacturer") or device.get("manufacturer"),
+        payload.get("osVersion") or payload.get("os_version") or device.get("osVersion") or device.get("os_version"),
+        payload.get("appVersion") or payload.get("app_version") or device.get("appVersion") or device.get("app_version"),
+    ]
+    cleaned = [str(x).strip() for x in parts if str(x or "").strip()]
+    return " | ".join(cleaned)
+
+
+def _device_blocked(device: dict | None) -> bool:
+    if not device:
+        return False
+    return _as_bool(device.get("isBlocked") if device.get("isBlocked") is not None else device.get("is_blocked"))
+
+
+def _assert_device_not_blocked(device: dict | None, context: str = "Device blocked") -> None:
+    if _device_blocked(device):
+        reason = (device or {}).get("blockReason") or (device or {}).get("block_reason") or context
+        raise HTTPException(status_code=403, detail=reason)
+
+
+def _serialize_ip_record(doc: dict) -> dict:
+    uuids = [u for u in (doc.get("uuids") or []) if u]
+    status = doc.get("status") or ("BLOCKED" if doc.get("bound_device_blocked") else "CLONED" if int(doc.get("clone_attempts") or 0) > 0 else "CLEAN")
+    return {
+        "ip": doc.get("ip"),
+        "first_uuid": doc.get("first_uuid"),
+        "registered_at": _safe_iso(doc.get("registered_at")),
+        "last_seen": _safe_iso(doc.get("last_seen")),
+        "clone_attempts": int(doc.get("clone_attempts") or 0),
+        "last_clone_uuid": doc.get("last_clone_uuid"),
+        "last_clone_at": _safe_iso(doc.get("last_clone_at")),
+        "bound_device_blocked": _as_bool(doc.get("bound_device_blocked")),
+        "uuid_count": len(uuids) or int(doc.get("uuid_count") or 0),
+        "blocked_uuid": doc.get("blocked_uuid"),
+        "blocked_at": _safe_iso(doc.get("blocked_at")),
+        "block_reason": doc.get("block_reason"),
+        "status": status,
+    }
+
+
+async def apply_ip_guard(uuid_: str, request: Request | StarletteRequest, payload: dict | None = None, existing_device: dict | None = None) -> dict:
+    now = datetime.utcnow()
+    client_ip = get_client_ip(request)
+    result = {
+        "ip": client_ip or "unknown",
+        "guarded": False,
+        "block_device": False,
+        "reason": None,
+        "first_uuid": None,
+        "clone_attempts": 0,
+    }
+
+    if not IP_GUARD_ENABLED or not client_ip or not _is_guardable_ip(client_ip):
+        return result
+
+    result["guarded"] = True
+    fingerprint = _device_fingerprint(payload, existing_device)
+    record = await ip_registry_col.find_one({"ip": client_ip})
+
+    if not record:
+        await ip_registry_col.insert_one({
+            "ip": client_ip,
+            "first_uuid": uuid_,
+            "registered_at": now,
+            "last_seen": now,
+            "last_uuid": uuid_,
+            "clone_attempts": 0,
+            "last_clone_uuid": None,
+            "last_clone_at": None,
+            "bound_device_blocked": False,
+            "blocked_uuid": None,
+            "blocked_at": None,
+            "block_reason": None,
+            "first_fingerprint": fingerprint,
+            "uuids": [uuid_],
+            "uuid_count": 1,
+            "status": "CLEAN",
+        })
+        return result
+
+    first_uuid = record.get("first_uuid")
+    known_uuids = [u for u in (record.get("uuids") or []) if u]
+    if first_uuid and first_uuid not in known_uuids:
+        known_uuids.insert(0, first_uuid)
+
+    if uuid_ == first_uuid or uuid_ in known_uuids:
+        await ip_registry_col.update_one(
+            {"ip": client_ip},
+            {
+                "$set": {
+                    "last_seen": now,
+                    "last_uuid": uuid_,
+                    "uuid_count": len(set(known_uuids or [uuid_])),
+                },
+                "$addToSet": {"uuids": uuid_},
+            },
+        )
+        result["first_uuid"] = first_uuid
+        result["clone_attempts"] = int(record.get("clone_attempts") or 0)
+        return result
+
+    clone_attempts = int(record.get("clone_attempts") or 0) + 1
+    reason = (
+        f"IP Guard auto-block: IP {client_ip} was first tied to {first_uuid or 'unknown'} "
+        f"and later re-registered with UUID {uuid_}."
+    )
+
+    update_doc = {
+        "last_seen": now,
+        "last_uuid": uuid_,
+        "clone_attempts": clone_attempts,
+        "last_clone_uuid": uuid_,
+        "last_clone_at": now,
+        "uuid_count": len(set(known_uuids + [uuid_])),
+        "status": "BLOCKED" if IP_GUARD_AUTO_BLOCK else "CLONED",
+    }
+    if IP_GUARD_AUTO_BLOCK:
+        update_doc.update({
+            "bound_device_blocked": True,
+            "blocked_uuid": uuid_,
+            "blocked_at": now,
+            "block_reason": reason,
+        })
+
+    await ip_registry_col.update_one(
+        {"ip": client_ip},
+        {
+            "$set": update_doc,
+            "$addToSet": {"uuids": uuid_},
+        },
+    )
+
+    if IP_GUARD_AUTO_BLOCK:
+        await devices_col.update_one(
+            {"uuid": uuid_},
+            {"$set": {
+                "isBlocked": True,
+                "blockReason": reason,
+                "blockedAt": now,
+                "ipGuardFlagged": True,
+                "lastIp": client_ip,
+            }},
+        )
+
+    result.update({
+        "block_device": IP_GUARD_AUTO_BLOCK,
+        "reason": reason,
+        "first_uuid": first_uuid,
+        "clone_attempts": clone_attempts,
+    })
+    return result
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔒 APP IDENTITY GUARD — rejects requests that don't come from the real app
+#
+# The Android app sends X-Client-Sig: <APP_CLIENT_SECRET> on every request.
+# Routes that serve app data (sessions, entitlement, content) require it.
+# Admin routes, webhooks, and the health check are exempt.
+#
+# If APP_CLIENT_SECRET is not set in the environment, the check is SKIPPED
+# (so existing deployments don't break before you add the env var).
+# ═══════════════════════════════════════════════════════════════════════════
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import JSONResponse
+
+# Prefixes that bypass the sig check entirely
+_SIG_EXEMPT_PREFIXES = (
+    "/admin",
+    "/webhooks",
+    "/payway/webhooks",    # PayWay-branded webhook aliases
+    "/payment-webhook",
+    "/api/schedules",
+    "/api/vipindi",
+    "/api/channels",      # admin panel still uses this legacy path
+    "/api/relay",          # relay has its own token auth
+    "/api/clearkey",       # ExoPlayer calls this directly for ClearKey DRM — no app headers
+    "/api/mpd",            # ClearKey MPD proxy — secured by session token
+    "/api/hls",            # HLS proxy — stateless
+    "/proxy",
+    "/hls",
+    "/ts",
+    "/mpd",
+    "/manifest",
+    "/drm",
+)
+
+import time
+from collections import defaultdict
+
+# Simple in-memory rate limiter
+_RATE_LIMIT_WINDOW = 60  # seconds
+_RATE_LIMIT_MAX_REQUESTS = 100
+_rate_limit_store = defaultdict(list)
+
+def is_rate_limited(identifier: str) -> bool:
+    now = time.time()
+    # Clean up old requests
+    _rate_limit_store[identifier] = [t for t in _rate_limit_store[identifier] if now - t < _RATE_LIMIT_WINDOW]
+    if len(_rate_limit_store[identifier]) >= _RATE_LIMIT_MAX_REQUESTS:
+        return True
+    _rate_limit_store[identifier].append(now)
+    return False
+
+class AppIdentityMiddleware(BaseHTTPMiddleware):
+    """
+    Validates app requests using Bearer token + X-DEVICE-ID + optional X-Client-Sig.
+    User-Agent is logged but NOT used as a gate — Android WebView UAs vary by device.
+    Real security: PUBLIC_API_TOKEN (Bearer) + APP_CLIENT_SECRET (X-Client-Sig).
+    """
+    async def dispatch(self, request: StarletteRequest, call_next):
+        path = request.url.path
+        client_ip = request.client.host if request.client else "?"
+
+        # Always allow: health check, root, OPTIONS pre-flight
+        if path in ("/", "/health") or request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Always allow exempt prefixes (admin, webhooks, DRM endpoints, etc.)
+        if any(path.startswith(p) for p in _SIG_EXEMPT_PREFIXES):
+            return await call_next(request)
+
+        # Allow internal Docker/loopback traffic
+        if client_ip.startswith("172.") or client_ip in ("127.0.0.1", "::1"):
+            return await call_next(request)
+
+        # /device/register only needs X-DEVICE-ID (no Bearer yet at registration)
+        is_bootstrap = path in {"/device/register"}
+
+        # 1. X-Client-Sig — enforce if APP_CLIENT_SECRET is configured
+        if APP_CLIENT_SECRET:
+            sig = request.headers.get("x-client-sig", "")
+            if not sig or not hmac.compare_digest(sig, APP_CLIENT_SECRET):
+                logger.warning(
+                    f"🚫 Blocked — bad X-Client-Sig | path={path} ip={client_ip} "
+                    f"ua={request.headers.get('user-agent', '')[:60]}"
+                )
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+        # 2. X-DEVICE-ID — required on all app routes
+        device_id = request.headers.get("x-device-id", "")
+        if not device_id:
+            logger.warning(f"🚫 Blocked — missing X-DEVICE-ID | path={path} ip={client_ip}")
+            return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+        # 3. Bearer token — required on all routes except bootstrap
+        if not is_bootstrap:
+            auth_header = request.headers.get("authorization", "")
+            if not auth_header.startswith("Bearer "):
+                logger.warning(f"🚫 Blocked — missing Bearer token | path={path} ip={client_ip}")
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+            provided_token = auth_header[7:].strip()
+            if not PUBLIC_API_TOKEN or not hmac.compare_digest(provided_token, PUBLIC_API_TOKEN):
+                logger.warning(f"🚫 Blocked — invalid Bearer token | path={path} ip={client_ip}")
+                return JSONResponse(status_code=403, content={"detail": "Forbidden"})
+
+        # 4. Rate limiting per device
+        if is_rate_limited(device_id):
+            logger.warning(f"🚫 Rate limited | device={device_id} path={path} ip={client_ip}")
+            return JSONResponse(status_code=429, content={"detail": "Too Many Requests"})
+
+        logger.debug(f"✅ Request validated | path={path} ip={client_ip} device={device_id}")
+        return await call_next(request)
+
+app.add_middleware(AppIdentityMiddleware)
+
+# ── Payment provider switch — registered BEFORE channel_routes to avoid wildcard shadowing ──
+@app.get("/admin/payment-provider")
+@app.get("/admin/payment-provider/")
+async def get_payment_provider(admin: dict = Depends(get_current_admin)):
+    """🔀 GET active payment provider"""
+    provider = await get_active_provider()
+    logger.info(f"🔎 Admin requested active payment provider -> {provider.upper()}")
+    return {"paymentProvider": provider}
+
+
+@app.put("/admin/payment-provider")
+@app.put("/admin/payment-provider/")
+async def set_payment_provider(
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin)
+):
+    """🔀 SET active payment provider — live switch, no restart needed"""
+    provider = (payload.get("paymentProvider") or "").strip().lower()
+    if provider not in ("zeno", "sonic"):
+        raise HTTPException(400, "paymentProvider must be 'zeno' or 'sonic'")
+
+    result = await config_col.update_one(
+        {"name": "global"},
+        {"$set": {"paymentProvider": provider}},
+        upsert=True
+    )
+    logger.info(
+        f"🔀 Payment provider switched to: {provider.upper()} | "
+        f"matched={result.matched_count} modified={result.modified_count} upserted={result.upserted_id}"
+    )
+    return {"paymentProvider": provider, "message": f"Switched to {provider.upper()} successfully"}
+
+
 # 🆕 Channel Link Manager routes
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ALIAS ADMIN ROUTES — /admin/aliases
+# Reads from the channel_aliases collection (same one the scraper writes to).
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/admin/aliases")
+async def admin_list_aliases(admin: dict = Depends(get_current_admin)):
+    """Return all aliases for the admin panel."""
+    from bson import ObjectId as _OID
+    docs = await db.channel_aliases.find({}).to_list(length=500)
+    return {"aliases": [
+        {
+            "id":          str(d.get("_id", "")),
+            "alias":       d.get("alias", ""),
+            "channelId":   d.get("channelId"),
+            "channelName": d.get("channelName") or d.get("name"),
+            "animalName":  d.get("animalName", ""),
+            "description": d.get("description"),
+            "isActive":    d.get("isActive", True),
+        }
+        for d in docs
+    ]}
+
+
+@app.post("/admin/aliases")
+async def admin_create_alias(
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin),
+):
+    import random, string as _string
+    channel_id  = payload.get("channelId")
+    animal_name = (payload.get("animalName") or "").strip().lower()
+    description = payload.get("description")
+    if not channel_id or not animal_name:
+        raise HTTPException(400, "channelId and animalName are required")
+
+    # Build a unique alias like "paka.xvwqr"
+    for _ in range(5):
+        suffix = "".join(random.choices(_string.ascii_lowercase, k=5))
+        alias  = f"{animal_name}.{suffix}"
+        if not await db.channel_aliases.find_one({"alias": alias}):
+            break
+
+    ch = await channels_col.find_one({"id": str(channel_id)})
+    now = datetime.utcnow()
+    doc = {
+        "alias":       alias,
+        "channelId":   str(channel_id),
+        "channelName": ch.get("name") if ch else None,
+        "animalName":  animal_name,
+        "description": description,
+        "isActive":    True,
+        "createdAt":   now,
+        "updatedAt":   now,
+    }
+    result = await db.channel_aliases.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    logger.info(f"Alias created: {alias} -> channelId={channel_id}")
+    return {"status": "ok", "alias": doc}
+
+
+@app.put("/admin/aliases/{alias_id}")
+async def admin_update_alias(
+    alias_id: str,
+    payload: dict = Body(...),
+    admin: dict = Depends(get_current_admin),
+):
+    from bson import ObjectId as _OID
+    if not _OID.is_valid(alias_id):
+        raise HTTPException(400, "Invalid alias ID")
+    update = {"updatedAt": datetime.utcnow()}
+    if "description" in payload:
+        update["description"] = payload["description"]
+    if "isActive" in payload:
+        update["isActive"] = bool(payload["isActive"])
+    res = await db.channel_aliases.update_one({"_id": _OID(alias_id)}, {"$set": update})
+    if res.matched_count == 0:
+        raise HTTPException(404, "Alias not found")
+    return {"status": "ok"}
+
+
+@app.delete("/admin/aliases/{alias_id}")
+async def admin_delete_alias(
+    alias_id: str,
+    admin: dict = Depends(get_current_admin),
+):
+    from bson import ObjectId as _OID
+    if not _OID.is_valid(alias_id):
+        raise HTTPException(400, "Invalid alias ID")
+    res = await db.channel_aliases.delete_one({"_id": _OID(alias_id)})
+    if res.deleted_count == 0:
+        raise HTTPException(404, "Alias not found")
+    logger.info(f"Alias deleted: {alias_id}")
+    return {"status": "ok"}
+
+@app.post("/admin/aliases/{alias_id}/duplicate")
+async def admin_duplicate_alias(
+    alias_id: str,
+    admin: dict = Depends(get_current_admin),
+):
+    from bson import ObjectId as _OID
+    import random, string as _string
+
+    if not _OID.is_valid(alias_id):
+        raise HTTPException(400, "Invalid alias ID")
+
+    original = await db.channel_aliases.find_one({"_id": _OID(alias_id)})
+    if not original:
+        raise HTTPException(404, "Alias not found")
+
+    animal_name = (original.get("animalName") or str(original.get("alias") or "copy").split(".")[0]).strip().lower()
+    channel_id = str(original.get("channelId") or "").strip()
+    if not channel_id:
+        raise HTTPException(400, "Original alias is missing channelId")
+
+    alias = None
+    for _ in range(10):
+        suffix = "".join(random.choices(_string.ascii_lowercase, k=5))
+        candidate = f"{animal_name}.{suffix}"
+        if not await db.channel_aliases.find_one({"alias": candidate}):
+            alias = candidate
+            break
+
+    if not alias:
+        raise HTTPException(500, "Could not generate duplicate alias")
+
+    ch = await channels_col.find_one({"id": channel_id})
+    now = datetime.utcnow()
+    doc = {
+        "alias": alias,
+        "channelId": channel_id,
+        "channelName": (ch or {}).get("name") or original.get("channelName"),
+        "animalName": animal_name,
+        "description": original.get("description"),
+        "isActive": original.get("isActive", True),
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    result = await db.channel_aliases.insert_one(doc)
+    doc["id"] = str(result.inserted_id)
+    return {"status": "ok", "alias": doc}
+
 setup_channel_routes(app, db, get_current_admin)
 
 
@@ -1308,23 +1786,59 @@ async def startup():
     global channel_scheduler
     # 🟡 Existing indexes
     await payments_col.create_index("order_id")
-    await payments_col.create_index("orderId")
-    await payments_col.create_index("internal_payment_id")
     await payments_col.create_index("status")
     await devices_col.create_index("uuid", unique=True)
-    await ip_guard_col.create_index([("ip", 1), ("uuid", 1)], unique=True)
-    await ip_guard_col.create_index("ip")
+    await devices_col.create_index("lastIp")
+    await ip_registry_col.create_index("ip", unique=True)
+    await ip_registry_col.create_index("first_uuid")
+    await ip_registry_col.create_index("last_clone_uuid")
     
-    # ✅ SONICPESA STARTUP VALIDATION
-    if not SONICPESA_API_KEY:
-        logger.error("❌ SONICPESA_API_KEY not set!")
-    if not SONICPESA_SECRET_KEY:
-        logger.error("❌ SONICPESA_SECRET_KEY not set!")
-    if not SONICPESA_WEBHOOK_URL:
-        logger.warning("⚠️ SONICPESA_WEBHOOK_URL not set - remember to configure it in SonicPesa dashboard")
+    # ✅ ZENO STARTUP VALIDATION
+    if not ZENO_API_KEY:
+        logger.error("❌ ZENO_API_KEY not set!")
+    if not ZENO_WEBHOOK_URL:
+        logger.warning("⚠️ ZENO_WEBHOOK_URL not set")
     else:
-        logger.info(f"✅ SonicPesa webhook URL configured: {SONICPESA_WEBHOOK_URL}")
-    logger.info(f"✅ SonicPesa base URL: {SONICPESA_BASE_URL}")
+        logger.info(f"✅ Zeno webhook URL configured: {ZENO_WEBHOOK_URL}")
+
+    # ✅ PUBLIC API TOKEN VALIDATION
+    if not PUBLIC_API_TOKEN:
+        logger.error(
+            "❌ PUBLIC_API_TOKEN is not set! "
+            "The Android app will NOT be able to authenticate. "
+            "Generate one: python3 -c 'import secrets; print(secrets.token_urlsafe(48))'"
+        )
+    else:
+        logger.info(f"✅ PUBLIC_API_TOKEN configured ({len(PUBLIC_API_TOKEN)} chars)")
+
+    # ✅ APP CLIENT SECRET VALIDATION
+    if not APP_CLIENT_SECRET:
+        logger.warning(
+            "⚠️  APP_CLIENT_SECRET is not set! "
+            "The app identity guard is DISABLED — any client can reach your API. "
+            "Generate one: python3 -c 'import secrets; print(secrets.token_hex(16))'"
+        )
+    else:
+        logger.info(f"✅ APP_CLIENT_SECRET configured — app identity guard is ACTIVE")
+
+    admin_routes = sorted(
+        f"{','.join(sorted(getattr(r, 'methods', []) or []))} {r.path}"
+        for r in app.routes
+        if str(getattr(r, "path", "")).startswith("/admin")
+    )
+    logger.info(f"📌 Registered admin routes: {admin_routes}")
+    logger.info(
+        "✅ Payment provider endpoint registered: "
+        f"{any(str(getattr(r, 'path', '')) in ('/admin/payment-provider', '/admin/payment-provider/') for r in app.routes)}"
+    )
+
+    # ✅ ONESIGNAL VALIDATION
+    if not ONESIGNAL_APP_ID:
+        logger.warning("⚠️ ONESIGNAL_APP_ID not set — push notifications disabled")
+    if not RELAY_BASE_URL:
+        logger.warning("⚠️ RELAY_BASE_URL not set — DRM relay will be disabled")
+    else:
+        logger.info(f"✅ Relay URL: {RELAY_BASE_URL}")
 
     # ✅ START THE BACKGROUND TASK
     asyncio.create_task(subscription_cleanup_task())
@@ -1354,7 +1868,8 @@ async def shutdown():
 
 @app.get("/")
 async def root():
-    return {"status": "OK", "service": "PixTb Max"}
+    # Deliberately vague — do not leak the internal service name
+    return {"status": "OK"}
 
 @app.get("/config")
 async def get_config():
@@ -1367,17 +1882,21 @@ async def get_config():
     telegram = support.get("telegram", "https://t.me/azammax")
 
     return {
-        "maintenance": flags.get("maintenance", False),
-        "forceLogout": flags.get("forceLogout", False),
-        "playerMode": flags.get("playerMode", "EXO",),
-        "trialSeconds": flags.get("trialSeconds", 300),
-        "packages": flags.get("packages", []),
-        "currency": flags.get("currency", "TZS"),
-        "banners": [serialize_doc(b) for b in banners],
-        "support_links": {
+        "maintenance":      flags.get("maintenance", False),
+        "forceLogout":      flags.get("forceLogout", False),
+        "playerMode":       flags.get("playerMode", "EXO"),
+        "trialSeconds":     flags.get("trialSeconds", 300),
+        "packages":         flags.get("packages", []),
+        "currency":         flags.get("currency", "TZS"),
+        "banners":          [serialize_doc(b) for b in banners],
+        "support_links":    {
             "whatsapp": whatsapp,
-            "telegram": telegram
-        }
+            "telegram": telegram,
+        },
+        # ✅ Public token — app stores this and uses it as Bearer on all requests
+        "public_api_token": PUBLIC_API_TOKEN,
+        "app_token":        PUBLIC_API_TOKEN,
+        "auth_token":       PUBLIC_API_TOKEN,
     }
 
 
@@ -1454,6 +1973,21 @@ async def delete_schedule(
         raise HTTPException(status_code=404, detail="Schedule not found")
     return {"status": "success"}
 
+@app.post("/api/schedules/{schedule_id}/duplicate")
+@app.post("/admin/schedules/{schedule_id}/duplicate")
+async def duplicate_schedule(schedule_id: str, admin: dict = Depends(get_current_admin)):
+    original = await schedules_col.find_one({"id": schedule_id})
+    if not original:
+        raise HTTPException(404, "Schedule not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["homeTeam"] = _copy_label(original.get("homeTeam") or original.get("home_team"))
+
+    await schedules_col.insert_one(new_doc)
+    saved_doc = await schedules_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # VIPINDI (TV Programs / Shows) ENDPOINTS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1490,6 +2024,25 @@ async def create_or_update_kipindi(
     )
     return {"status": "success", "id": kipindi_id}
 
+@app.put("/api/vipindi/{kipindi_id}")
+@app.put("/admin/vipindi/{kipindi_id}")
+async def update_kipindi(
+    kipindi_id: str,
+    kipindi: Kipindi,
+    admin: dict = Depends(get_current_admin)
+):
+    kipindi_dict = kipindi.dict()
+    kipindi_dict["id"] = kipindi_id
+    existing = await vipindi_col.find_one({"id": kipindi_id})
+    kipindi_dict["createdAt"] = (existing or {}).get("createdAt") or datetime.utcnow().isoformat()
+    await vipindi_col.update_one(
+        {"id": kipindi_id},
+        {"$set": kipindi_dict},
+        upsert=True,
+    )
+    saved_doc = await vipindi_col.find_one({"id": kipindi_id})
+    return serialize_doc(saved_doc, for_admin=True)
+
 @app.delete("/api/vipindi/{kipindi_id}")
 @app.delete("/admin/vipindi/{kipindi_id}")
 async def delete_kipindi(
@@ -1500,6 +2053,22 @@ async def delete_kipindi(
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Kipindi not found")
     return {"status": "success"}
+
+@app.post("/api/vipindi/{kipindi_id}/duplicate")
+@app.post("/admin/vipindi/{kipindi_id}/duplicate")
+async def duplicate_kipindi(kipindi_id: str, admin: dict = Depends(get_current_admin)):
+    original = await vipindi_col.find_one({"id": kipindi_id})
+    if not original:
+        raise HTTPException(404, "Kipindi not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["name"] = _copy_label(original.get("name"))
+    new_doc["createdAt"] = datetime.utcnow().isoformat()
+
+    await vipindi_col.insert_one(new_doc)
+    saved_doc = await vipindi_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.post("/schedules/remind")
 async def add_reminder(payload: dict = Body(...)):
@@ -1527,121 +2096,64 @@ async def add_reminder(payload: dict = Body(...)):
 
 @app.post("/device/register")
 async def register_device(payload: dict, request: Request):
-    uuid_ = payload.get("uuid")
+    uuid_ = str(payload.get("uuid") or "").strip()
     if not uuid_:
         raise HTTPException(400, "UUID required")
 
     now = datetime.utcnow()
+    flags = await get_admin_flags()
     device = await devices_col.find_one({"uuid": uuid_})
+    guard = await apply_ip_guard(uuid_, request, payload, existing_device=device)
+    client_ip = guard.get("ip") or get_client_ip(request) or "unknown"
+
+    update_fields = {
+        "lastSeen": now,
+        "lastIp": client_ip,
+        "deviceModel": payload.get("deviceModel") or payload.get("device_model") or (device or {}).get("deviceModel"),
+        "osVersion": payload.get("osVersion") or payload.get("os_version") or (device or {}).get("osVersion"),
+        "appVersion": payload.get("appVersion") or payload.get("app_version") or (device or {}).get("appVersion"),
+        "brand": payload.get("brand") or (device or {}).get("brand"),
+        "manufacturer": payload.get("manufacturer") or (device or {}).get("manufacturer"),
+    }
+
+    if guard.get("block_device"):
+        update_fields.update({
+            "isBlocked": True,
+            "blockReason": guard.get("reason"),
+            "blockedAt": now,
+            "ipGuardFlagged": True,
+        })
+
+    cleaned_updates = {k: v for k, v in update_fields.items() if v is not None}
 
     if not device:
-        # ── NEW DEVICE: apply IP guard before creating the record ──────────
-        client_ip = request.client.host if request.client else "unknown"
-
-        # Count how many *distinct non-premium* devices are already registered from this IP.
-        # Premium devices are excluded so that a premium user's home/office IP does not
-        # block other family members from registering free devices.
-        non_premium_uuids_on_ip = await ip_guard_col.distinct("uuid", {"ip": client_ip})
-        premium_on_ip = await devices_col.count_documents({
-            "uuid": {"$in": non_premium_uuids_on_ip},
-            "isPremium": True
-        })
-        existing_count = max(0, len(non_premium_uuids_on_ip) - premium_on_ip)
-
-        if existing_count >= MAX_DEVICES_PER_IP:
-            logger.warning(
-                f"🚫 IP guard blocked new device {uuid_} from {client_ip} "
-                f"({existing_count} devices already registered)"
-            )
-            # Update the device record with blocked status before raising HTTPException
-            block_reason_msg = (
-                f"IP Guard auto-block: IP {client_ip} exceeded device limit "
-                f"({existing_count} devices already registered, max {MAX_DEVICES_PER_IP})."
-            )
-            await devices_col.update_one(
-                {"uuid": uuid_},
-                {
-                    "$set": {
-                        "uuid": uuid_,
-                        "createdAt": now,
-                        "lastSeen": now,
-                        "lastIp": client_ip,
-                        "appVersion": payload.get("appVersion"),
-                        "osVersion": payload.get("osVersion"),
-                        "deviceModel": payload.get("deviceModel"),
-                        "brand": payload.get("brand"),
-                        "manufacturer": payload.get("manufacturer"),
-                        "isPremium": False,
-                        "trialRemaining": 12,
-                        "trialUsed": False,
-                        "isBlocked": True,  # Set isBlocked to True
-                        "blockReason": block_reason_msg, # Set blockReason
-                        "blockedAt": now, # Set blockedAt
-                    }
-                },
-                upsert=True
-            )
-            raise HTTPException(
-                status_code=429,
-                detail=(
-                    f"Too many devices registered from your network "
-                    f"(max {MAX_DEVICES_PER_IP}). "
-                    "Please contact support if this is a mistake."
-                ),
-            )
-
-        flags = await get_admin_flags()
-
-        # ── Create the device record ──────────────────────────────────────
-        # Use update_one with upsert=True instead of insert_one to avoid a
-        # race-condition DuplicateKeyError when two requests arrive at the
-        # same time for the same UUID.
-        await devices_col.update_one(
-            {"uuid": uuid_},
-            {
-                "$setOnInsert": {
-                    "uuid": uuid_,
-                    "isPremium": False,
-                    "trialRemaining": flags.get("trialSeconds", 300),
-                    "createdAt": now,
-                },
-                "$set": {"lastSeen": now},
-            },
-            upsert=True,
-        )
-
-        # ── Record this IP ↔ UUID mapping (ignore if it already exists) ──
-        try:
-            await ip_guard_col.insert_one(
-                {"ip": client_ip, "uuid": uuid_, "createdAt": now}
-            )
-        except DuplicateKeyError:
-            pass  # mapping already recorded — not an error
-
+        to_insert = {
+            "uuid": uuid_,
+            "isPremium": False,
+            "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
+            "trialUsed": False,
+            "createdAt": now,
+            "lastSeen": now,
+            "lastIp": client_ip,
+        }
+        to_insert.update(cleaned_updates)
+        await devices_col.insert_one(to_insert)
+        device = to_insert
     else:
-        # ── RETURNING DEVICE ─────────────────────────────────────────────
-        # Premium users are never blocked; just touch lastSeen and return.
-        is_premium = device.get("isPremium", False)
-        client_ip = request.client.host if request.client else "unknown"
+        await devices_col.update_one({"uuid": uuid_}, {"$set": cleaned_updates})
+        device.update(cleaned_updates)
 
-        if not is_premium:
-            # Ensure the ip_guard record exists for this device (backfill for
-            # devices that registered before ip_guard was introduced).
-            try:
-                await ip_guard_col.update_one(
-                    {"ip": client_ip, "uuid": uuid_},
-                    {"$setOnInsert": {"ip": client_ip, "uuid": uuid_, "createdAt": now}},
-                    upsert=True,
-                )
-            except DuplicateKeyError:
-                pass
+    blocked = _device_blocked(device)
 
-        await devices_col.update_one(
-            {"uuid": uuid_},
-            {"$set": {"lastSeen": now}},
-        )
-
-    return {"status": "OK"}
+    return {
+        "status": "BLOCKED" if blocked else "OK",
+        "public_api_token": PUBLIC_API_TOKEN,
+        "app_token": PUBLIC_API_TOKEN,
+        "uuid": uuid_,
+        "blocked": blocked,
+        "blockReason": device.get("blockReason"),
+        "ipGuard": guard,
+    }
 
 @app.get("/device/status/{uuid}")
 async def device_status(uuid: str):
@@ -1652,65 +2164,84 @@ async def device_status(uuid: str):
     # ✅ FIX: Use centralized expiry logic
     device = await maybe_auto_expire_premium(device)
 
+    _assert_device_not_blocked(device, "Device blocked by IP Guard")
+
+    # ✅ SAFETY: Explicit type checking for isPremium
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+
     # If trial is exhausted, ensure it's 0
     trial_remaining = device.get("trialRemaining", 0)
     if device.get("trialUsed", False) and trial_remaining <= 0:
         trial_remaining = 0
 
     return {
-        "isPremium": device.get("isPremium", False),
+        "isPremium": is_premium,
         "trialRemaining": trial_remaining
     }
 
 @app.get("/entitlement")
-async def get_entitlement(x_device_id: str = Header(None)):
+async def get_entitlement(request: Request, x_device_id: str = Header(None)):
     if not x_device_id:
         raise HTTPException(400, "X-DEVICE-ID header required")
-    
-    device = await devices_col.find_one({"uuid": x_device_id})
+
     now = datetime.utcnow()
     flags = await get_admin_flags()
+    device = await devices_col.find_one({"uuid": x_device_id})
+    client_ip = get_client_ip(request) or "unknown"
 
     if not device:
-        # Use upsert to avoid DuplicateKeyError if two requests race for the same device
+        guard = await apply_ip_guard(x_device_id, request, {}, None)
+        device = {
+            "uuid": x_device_id,
+            "isPremium": False,
+            "trialRemaining": int(flags.get("trialSeconds", 300) or 300),
+            "trialStartedAt": now,
+            "trialUsed": False,
+            "trialPausedAt": None,
+            "lastChannelId": None,
+            "createdAt": now,
+            "lastSeen": now,
+            "lastIp": client_ip,
+        }
+        if guard.get("block_device"):
+            device.update({
+                "isBlocked": True,
+                "blockReason": guard.get("reason"),
+                "blockedAt": now,
+                "ipGuardFlagged": True,
+            })
+        await devices_col.insert_one(device)
+    else:
         await devices_col.update_one(
             {"uuid": x_device_id},
-            {
-                "$setOnInsert": {
-                    "uuid": x_device_id,
-                    "isPremium": False,
-                    "trialRemaining": flags.get("trialSeconds", 300),
-                    "trialStartedAt": now,
-                    "trialUsed": False,
-                    "trialPausedAt": None,
-                    "lastChannelId": None,
-                    "createdAt": now,
-                },
-                "$set": {"lastSeen": now},
-            },
-            upsert=True,
+            {"$set": {"lastSeen": now, "lastIp": client_ip}},
         )
-        device = await devices_col.find_one({"uuid": x_device_id})
-        if not device:
-            # Extremely unlikely fallback
-            device = {"uuid": x_device_id, "isPremium": False,
-                      "trialRemaining": flags.get("trialSeconds", 300),
-                      "trialUsed": False}
-    else:
-        # ✅ NEW: Check if Premium has expired when checking entitlement
+        device["lastSeen"] = now
+        device["lastIp"] = client_ip
         device = await maybe_auto_expire_premium(device)
-    
-    # Check if trial was already used (one-time enforcement)
+
+    _assert_device_not_blocked(device, "Device blocked by IP Guard")
+
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+
     trial_used = device.get("trialUsed", False)
     trial_remaining = device.get("trialRemaining", 0)
-    
+
     return {
-        "isPremium": device.get("isPremium", False),
+        "isPremium": is_premium,
         "subscriptionExpiresAt": int(device["premiumUntil"].timestamp() * 1000) if device.get("premiumUntil") else None,
         "trialRemainingSeconds": trial_remaining,
-        "trialUsed": trial_used,  # Inform app if trial was already used
+        "trialUsed": trial_used,
         "playerMode": flags.get("playerMode", "EXO"),
-        "maintenance": flags.get("maintenance", False)
+        "maintenance": flags.get("maintenance", False),
     }
 
 @app.post("/session/start")
@@ -1739,13 +2270,15 @@ async def start_session(payload: dict, request: Request):
     # ✅ Ensure /session/start applies auto-expiry BEFORE building the session response
     device = await maybe_auto_expire_premium(device)
 
+    _assert_device_not_blocked(device, "Device blocked. Contact support.")
+
     flags = await get_admin_flags()
     if flags.get("maintenance"):
         raise HTTPException(503, "Maintenance")
 
     # Trial / Premium check
-    is_premium = device.get("isPremium", False)
-    premium_until = device.get("premiumUntil")
+    is_premium = device.get("isPremium") or device.get("is_premium") or False
+    premium_until = device.get("premiumUntil") or device.get("premium_until")
     trial_remaining = device.get("trialRemaining", 0)
     trial_used = device.get("trialUsed", False)
     
@@ -1801,7 +2334,29 @@ async def start_session(payload: dict, request: Request):
     channel = Channel(**channel_doc)
 
     # 🔥 TRIAL LOGIC: Only apply trial to PREMIUM channels for non-premium users
-    if not is_premium and channel.is_premium:
+    # Force-sync the user's premium status before checking the paywall
+    
+    # ✅ SAFETY FIX #1: Explicit type checking for isPremium (handle string "true")
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        user_is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        user_is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+    
+    premium_until_value = device.get("premiumUntil") or device.get("premium_until")
+    now_check = datetime.utcnow()
+    
+    # ✅ SAFETY FIX #2: Double-check that premium subscription is still active
+    if user_is_premium and premium_until_value:
+        if isinstance(premium_until_value, datetime) and premium_until_value <= now_check:
+            logger.warning(f"Premium expired in /session/start for {uuid_}")
+            user_is_premium = False
+    
+    # ✅ FIX: If user is premium, they should NOT be treated as a trial user
+    # Ensure channelIsPremium is FALSE for premium users so the app doesn't start the timer
+    effective_channel_is_premium = channel.is_premium and not user_is_premium
+
+    if channel.is_premium and not user_is_premium:
         # Check if trial was ALREADY used up completely
         if trial_used and trial_remaining <= 0:
             # Trial is exhausted - BLOCK ACCESS
@@ -1884,11 +2439,13 @@ async def start_session(payload: dict, request: Request):
                 channel.headers = {}
             channel.headers.update(resolved_alias["headers"])
 
-        # ✅ Fallback: Attach ClearKey statically if defined in CLEARKEY_BY_CHANNEL_ID
+        # ✅ Static ClearKey always wins over anything the scraper returned.
+        # The scraper may set drmType=WIDEVINE/licenseUrl for Azam channels that
+        # actually use ClearKey — the hardcoded map is the source of truth.
         if "CLEARKEY_BY_CHANNEL_ID" in globals() and stream_type == "DASH":
             clearkey = CLEARKEY_BY_CHANNEL_ID.get(resolved_alias["channelId"])
-            if clearkey and not channel.license_url:
-                logger.info(f"🔑 Found Static ClearKey for Alias Channel {resolved_alias['channelId']}")
+            if clearkey:
+                logger.info(f"🔑 ClearKey override for channelId={resolved_alias['channelId']}")
                 channel.drm_type = "CLEARKEY"
                 channel.license_url = clearkey
         
@@ -1977,9 +2534,14 @@ async def start_session(payload: dict, request: Request):
         #     f"DASH finalization | upstream_mpd={upstream_mpd_url} | drm_type={channel.drm_type} | clearkey_proxy={use_clearkey_mpd_proxy}"
         # )
         if use_clearkey_mpd_proxy:
-            base_url = str(request.base_url).rstrip('/')
+            base_url = BACKEND_BASE_URL or str(request.base_url).rstrip('/')
             mpd_url = f"{base_url}/api/mpd/clearkey-proxy/{token}"
             # logger.info(f"🔁 Using Android ClearKey MPD proxy: {mpd_url}")
+
+    # Compute server-side trial deadline so heartbeat never trusts app clock
+    _trial_deadline = None
+    if channel.is_premium and not user_is_premium and trial_remaining > 0:
+        _trial_deadline = datetime.utcnow() + timedelta(seconds=int(trial_remaining))
 
     await sessions_col.insert_one({
         "uuid": uuid_,
@@ -1997,15 +2559,15 @@ async def start_session(payload: dict, request: Request):
         "player_mode": flags.get("playerMode", "EXO"),
         "channel_id": channel_id,
         "clearkey_mpd_proxy": use_clearkey_mpd_proxy,
+        "trialDeadlineAt": _trial_deadline,  # server-side deadline — never from app
     })
 
     if stream_type == "HLS":
         # ✅ HLS Proxy Integration: Route through proxy if custom headers are present OR if it's a YCN provider
         # We check is_ycn_provider(mpd_url) to catch cases where admin only pasted the URL
         if channel.user_agent or channel.referer or channel.origin or is_ycn_provider(mpd_url):
-            # Use absolute URL for the proxy to ensure the player can reach it
-            # request.base_url is safer than hardcoding the domain
-            base_url = str(request.base_url).rstrip('/')
+            # Use BACKEND_BASE_URL env var if set, otherwise fall back to request.base_url
+            base_url = BACKEND_BASE_URL or str(request.base_url).rstrip('/')
             proxy_url = f"{base_url}/api/hls/proxy"
             mpd_url = f"{proxy_url}?url={quote(mpd_url)}"
             logger.info(f"🔗 HLS Proxying enabled for: {channel.name} (YCN or Custom Headers) | Proxy URL: {mpd_url}")
@@ -2021,8 +2583,8 @@ async def start_session(payload: dict, request: Request):
             "drm_type": "NONE",
             "drm_data": None,                                 # 🔥 PATCH 1: Add drm_data for app compatibility
             "headers": channel.headers,
-            "trialRemaining": trial_remaining,                # ✅ Add trial remaining
-            "channelIsPremium": channel.is_premium            # ✅ CRITICAL: Pass channel premium status
+            "trialRemaining": 0 if user_is_premium else trial_remaining,                # ✅ Add trial remaining
+            "channelIsPremium": effective_channel_is_premium            # ✅ CRITICAL: Pass channel premium status
         }
 
     elif stream_type == "DASH":
@@ -2034,7 +2596,7 @@ async def start_session(payload: dict, request: Request):
         final_license_url = channel.license_url
         if channel.drm_type and channel.drm_type.upper() == "CLEARKEY" and channel.license_url and ":" in channel.license_url:
             kid, key = channel.license_url.split(":")
-            base_url = str(request.base_url).rstrip('/')
+            base_url = BACKEND_BASE_URL or str(request.base_url).rstrip('/')
             final_license_url = f"{base_url}/api/clearkey/{kid.strip()}/{key.strip()}"
             # logger.info(f"🔗 Generated ClearKey Endpoint for Android: {final_license_url}")
 
@@ -2048,8 +2610,8 @@ async def start_session(payload: dict, request: Request):
             "player_mode": flags.get("playerMode", "EXO"),   
             "drm_type": (channel.drm_type or "NONE").upper(),  # Normalize to uppercase
             "headers": channel.headers or {},  # Never null
-            "trialRemaining": trial_remaining,                
-            "channelIsPremium": channel.is_premium or False  # Never null
+            "trialRemaining": 0 if user_is_premium else trial_remaining,                
+            "channelIsPremium": effective_channel_is_premium  # Never null
         }
         
         # 🔥 PATCH 4: For ClearKey, include drm_data (ALWAYS for app compatibility)
@@ -2140,15 +2702,130 @@ async def admin_stats(admin: dict = Depends(get_current_admin)):
         "returning_customers": top_customers
     }
 
+
+@app.get("/admin/ip-registry")
+async def admin_ip_registry(
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    admin: dict = Depends(get_current_admin),
+):
+    query = {}
+    if search:
+        query["$or"] = [
+            {"ip": {"$regex": re.escape(search), "$options": "i"}},
+            {"first_uuid": {"$regex": re.escape(search), "$options": "i"}},
+            {"last_clone_uuid": {"$regex": re.escape(search), "$options": "i"}},
+            {"uuids": {"$elemMatch": {"$regex": re.escape(search), "$options": "i"}}},
+        ]
+
+    docs = await ip_registry_col.find(query).sort([
+        ("bound_device_blocked", -1),
+        ("clone_attempts", -1),
+        ("last_clone_at", -1),
+        ("last_seen", -1),
+    ]).to_list(None)
+
+    rows = [_serialize_ip_record(doc) for doc in docs]
+    normalized_status = (status or "").strip().upper()
+    if normalized_status == "CLONED":
+        rows = [row for row in rows if int(row.get("clone_attempts") or 0) > 0]
+    elif normalized_status == "BLOCKED":
+        rows = [row for row in rows if row.get("bound_device_blocked")]
+    elif normalized_status == "CLEAN":
+        rows = [row for row in rows if int(row.get("clone_attempts") or 0) == 0 and not row.get("bound_device_blocked")]
+
+    return rows
+
+
+@app.post("/admin/ip-registry/block")
+async def admin_ip_registry_block(payload: dict = Body(...), admin: dict = Depends(get_current_admin)):
+    ip = str(payload.get("ip") or "").strip()
+    reason = str(payload.get("reason") or "Manually blocked via IP Guard").strip()
+    if not ip:
+        raise HTTPException(400, "IP required")
+
+    now = datetime.utcnow()
+    record = await ip_registry_col.find_one({"ip": ip}) or {"ip": ip, "uuids": []}
+    first_uuid = record.get("first_uuid")
+    uuids = [u for u in (record.get("uuids") or []) if u]
+    if first_uuid and first_uuid not in uuids:
+        uuids.insert(0, first_uuid)
+
+    await ip_registry_col.update_one(
+        {"ip": ip},
+        {"$set": {
+            "bound_device_blocked": True,
+            "blocked_uuid": first_uuid or (uuids[0] if uuids else None),
+            "blocked_at": now,
+            "block_reason": reason,
+            "status": "BLOCKED",
+            "last_seen": record.get("last_seen") or now,
+            "registered_at": record.get("registered_at") or now,
+            "first_uuid": first_uuid,
+            "uuid_count": len(set(uuids)),
+        }},
+        upsert=True,
+    )
+
+    if uuids:
+        await devices_col.update_many(
+            {"uuid": {"$in": list(set(uuids))}},
+            {"$set": {"isBlocked": True, "blockReason": reason, "blockedAt": now}},
+        )
+
+    return {"status": "OK", "ip": ip, "blockedUuids": list(set(uuids))}
+
+
+@app.post("/admin/ip-registry/unblock")
+async def admin_ip_registry_unblock(payload: dict = Body(...), admin: dict = Depends(get_current_admin)):
+    ip = str(payload.get("ip") or "").strip()
+    uuid_ = str(payload.get("uuid") or "").strip()
+
+    record = None
+    if ip:
+        record = await ip_registry_col.find_one({"ip": ip})
+    elif uuid_:
+        record = await ip_registry_col.find_one({
+            "$or": [
+                {"first_uuid": uuid_},
+                {"blocked_uuid": uuid_},
+                {"uuids": uuid_},
+                {"last_clone_uuid": uuid_},
+            ]
+        })
+
+    uuids = []
+    if record:
+        first_uuid = record.get("first_uuid")
+        uuids = [u for u in (record.get("uuids") or []) if u]
+        if first_uuid and first_uuid not in uuids:
+            uuids.insert(0, first_uuid)
+        await ip_registry_col.delete_one({"ip": record.get("ip")})
+        ip = record.get("ip") or ip
+    elif uuid_:
+        uuids = [uuid_]
+
+    if uuids:
+        await devices_col.update_many(
+            {"uuid": {"$in": list(set(uuids))}},
+            {"$set": {"isBlocked": False}, "$unset": {"blockReason": "", "blockedAt": "", "ipGuardFlagged": ""}},
+        )
+
+    return {"status": "OK", "ip": ip, "unblockedUuids": list(set(uuids))}
+
+
+@app.delete("/admin/ip-registry/{ip}")
+async def admin_delete_ip_registry_record(ip: str, admin: dict = Depends(get_current_admin)):
+    decoded_ip = unquote(ip)
+    result = await ip_registry_col.delete_one({"ip": decoded_ip})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "IP record not found")
+    return {"status": "OK", "ip": decoded_ip}
+
+
 @app.get("/admin/users")
 async def admin_users(admin: dict = Depends(get_current_admin)):
     users = await devices_col.find().sort("createdAt", -1).to_list(None)
-
-    # Build uuid→ip lookup from ip_guard so admins can see each device's registered IP
-    ip_records = await ip_guard_col.find({}, {"uuid": 1, "ip": 1, "_id": 0}).to_list(None)
-    uuid_to_ip: dict = {}
-    for rec in ip_records:
-        uuid_to_ip.setdefault(rec["uuid"], rec["ip"])
 
     return [
         {
@@ -2157,12 +2834,11 @@ async def admin_users(admin: dict = Depends(get_current_admin)):
             "trialRemaining": u.get("trialRemaining", 0),
             "premiumUntil": u.get("premiumUntil").isoformat() if u.get("premiumUntil") and hasattr(u.get("premiumUntil"), "isoformat") else u.get("premiumUntil"),
             "createdAt": u.get("createdAt").isoformat() if u.get("createdAt") and hasattr(u.get("createdAt"), "isoformat") else u.get("createdAt"),
-            "lastSeen": u.get("lastSeen").isoformat() if u.get("lastSeen") and hasattr(u.get("lastSeen"), "isoformat") else u.get("lastSeen"),
+            "lastSeen": u.get("lastSeen").isoformat() if u.get("lastSeen") and hasattr(u.get("lastSeen"), "isoformat") else u.get("createdAt"),
             "is_blocked": u.get("isBlocked", False),
             "device_model": u.get("deviceModel", "Unknown"),
             "os_version": u.get("osVersion", "Unknown"),
             "app_version": u.get("appVersion", "1.0.0"),
-            "registered_ip": uuid_to_ip.get(u.get("uuid")),
         }
         for u in users
     ]
@@ -2172,6 +2848,7 @@ async def admin_users(admin: dict = Depends(get_current_admin)):
 
 # 🔧 PATCH 2 – USE for_admin=True IN ADMIN ENDPOINTS
 @app.get("/api/channels")
+@app.get("/admin/channels")
 async def admin_channels(admin: dict = Depends(get_current_admin)):
     channels = await channels_col.find().sort("order", 1).to_list(None)
     return [serialize_doc(c, for_admin=True) for c in channels]
@@ -2194,6 +2871,7 @@ async def admin_reorder_channels(reorder_data: List[Dict[str, Any]] = Body(...),
 
 # 🔧 PATCH 3 – BLOCK INVALID WIDEVINE CHANNELS (CRITICAL)
 @app.post("/api/channels")
+@app.post("/admin/channels")
 async def admin_create_channel(channel: Channel, admin: dict = Depends(get_current_admin)):
     # 🔧 PATCH 3 – BLOCK INVALID WIDEVINE CHANNELS (CRITICAL)
     if channel.drm_type == "WIDEVINE":
@@ -2235,6 +2913,7 @@ async def admin_create_channel(channel: Channel, admin: dict = Depends(get_curre
 
 
 @app.put("/api/channels/{channel_id}")
+@app.put("/admin/channels/{channel_id}")
 async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = Depends(get_current_admin)):
     # Removed strict validation for mpd_url or alias presence
 
@@ -2370,9 +3049,46 @@ async def admin_update_channel(channel_id: str, channel: Channel, admin: dict = 
     return serialize_doc(updated_doc, for_admin=True)
 
 @app.delete("/api/channels/{channel_id}")
+@app.delete("/admin/channels/{channel_id}")
 async def admin_delete_channel(channel_id: str, admin: dict = Depends(get_current_admin)):
     await channels_col.delete_one({"id": channel_id})
     return {"status": "OK"}
+
+@app.post("/api/channels/bulk")
+@app.post("/admin/channels/bulk")
+async def admin_bulk_update_channels(payload: dict = Body(...), admin: dict = Depends(get_current_admin)):
+    ids = [str(v) for v in (payload.get("ids") or []) if str(v).strip()]
+    action = str(payload.get("action") or "").upper()
+    if not ids:
+        raise HTTPException(400, "ids are required")
+    if action not in {"ACTIVATE", "DEACTIVATE"}:
+        raise HTTPException(400, "action must be ACTIVATE or DEACTIVATE")
+
+    result = await channels_col.update_many(
+        {"id": {"$in": ids}},
+        {"$set": {"active": action == "ACTIVATE"}},
+    )
+    return {
+        "status": "success",
+        "matched": result.matched_count,
+        "modified": result.modified_count,
+    }
+
+@app.post("/api/channels/{channel_id}/duplicate")
+@app.post("/admin/channels/{channel_id}/duplicate")
+async def admin_duplicate_channel(channel_id: str, admin: dict = Depends(get_current_admin)):
+    original = await channels_col.find_one({"id": channel_id})
+    if not original:
+        raise HTTPException(404, "Channel not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["name"] = _copy_label(original.get("name"))
+    new_doc["order"] = int(original.get("order", 0) or 0) + 1
+
+    await channels_col.insert_one(new_doc)
+    saved_doc = await channels_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.get("/admin/categories")
 async def admin_categories(admin: dict = Depends(get_current_admin)):
@@ -2387,7 +3103,20 @@ async def admin_create_category(category: Category, admin: dict = Depends(get_cu
     {"$set": category_dict},      # Update it with new data
     upsert=True                   # Create it if it doesn't exist
 )
-    return serialize_doc(category_dict, for_admin=True)
+    saved_doc = await categories_col.find_one({"id": category_dict["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
+
+@app.put("/admin/categories/{category_id}")
+async def admin_update_category(category_id: str, category: Category, admin: dict = Depends(get_current_admin)):
+    category_dict = category.dict()
+    category_dict["id"] = category_id
+    await categories_col.update_one(
+        {"id": category_id},
+        {"$set": category_dict},
+        upsert=True,
+    )
+    saved_doc = await categories_col.find_one({"id": category_id})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.delete("/admin/categories/{category_id}")
 async def admin_delete_category(category_id: str, admin: dict = Depends(get_current_admin)):
@@ -2407,6 +3136,21 @@ async def admin_reorder_categories(order_data: List[Dict[str, Any]], admin: dict
                 {"$set": {"order": item["order"]}}
             )
     return {"status": "OK"}
+
+@app.post("/admin/categories/{category_id}/duplicate")
+async def admin_duplicate_category(category_id: str, admin: dict = Depends(get_current_admin)):
+    original = await categories_col.find_one({"id": category_id})
+    if not original:
+        raise HTTPException(404, "Category not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["name"] = _copy_label(original.get("name"))
+    new_doc["order"] = int(original.get("order", 0) or 0) + 1
+
+    await categories_col.insert_one(new_doc)
+    saved_doc = await categories_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
 
 @app.get("/admin/banners")
 async def admin_banners(admin: dict = Depends(get_current_admin)):
@@ -2461,6 +3205,24 @@ async def admin_delete_banner(banner_id: str, admin: dict = Depends(get_current_
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail=f"Banner not found with ID: {banner_id}")
     return {"status": "success"}
+
+@app.post("/admin/banners/{banner_id}/duplicate")
+async def admin_duplicate_banner(banner_id: str, admin: dict = Depends(get_current_admin)):
+    from bson import ObjectId
+
+    original = await banners_col.find_one({"id": banner_id})
+    if not original and ObjectId.is_valid(banner_id):
+        original = await banners_col.find_one({"_id": ObjectId(banner_id)})
+    if not original:
+        raise HTTPException(404, "Banner not found")
+
+    new_doc = {k: v for k, v in original.items() if k != "_id"}
+    new_doc["id"] = str(uuid.uuid4())
+    new_doc["title"] = _copy_label(original.get("title"))
+
+    await banners_col.insert_one(new_doc)
+    saved_doc = await banners_col.find_one({"id": new_doc["id"]})
+    return serialize_doc(saved_doc, for_admin=True)
 
 from bson import ObjectId
 
@@ -2551,7 +3313,7 @@ async def admin_update_config(config: dict, admin: dict = Depends(get_current_ad
             raise HTTPException(400, "trialSeconds out of allowed range (0..86400)")
 
     # allow-list config keys to avoid accidental garbage writes
-    allowed = {"maintenance", "forceLogout", "playerMode", "trialSeconds", "packages", "currency", "support", "whatsapp_support"}
+    allowed = {"maintenance", "forceLogout", "playerMode", "trialSeconds", "packages", "currency", "support", "whatsapp_support", "paymentProvider"}
     cleaned = {k: v for k, v in config.items() if k in allowed}
     
     # 🔧 Compatibility Patch: If admin panel sends whatsapp_support directly, move it to support object
@@ -2571,6 +3333,8 @@ async def admin_update_config(config: dict, admin: dict = Depends(get_current_ad
     )
 
     return {"status": "OK"}
+
+
 
 
 
@@ -2662,7 +3426,9 @@ async def get_banners():
 # ✅ Step 3 — Harden /api/relay/stream/{token} for ExoPlayer
 from fastapi.responses import StreamingResponse
 
-def modify_mpd_manifest(mpd_xml: str, session_token: str, base_url: str = "https://p01--relayapp--mylcvdlxjz2r.code.run") -> str:
+def modify_mpd_manifest(mpd_xml: str, session_token: str, base_url: str = None) -> str:
+    if base_url is None:
+        base_url = RELAY_BASE_URL
     """
     Modify MPD manifest to replace all license URLs with relay URLs.
     
@@ -2759,11 +3525,10 @@ async def hls_proxy(url: str, request: Request, user_agent: Optional[str] = Head
     
     if is_ycn_provider(target_url):
         logger.info(f"✅ YCN Provider Detected | host={_host(target_url)}")
-        # For YCN, we MUST use the preset User-Agent to match the Referer/Origin
-        # We only override if the current UA is missing or is the default ExoPlayer UA
-        if not user_agent or "ExoPlayer" in user_agent or "ReactNativeVideo" in user_agent:
-            user_agent = HET140_PRESET["user_agent"]
-            logger.info(f"   -> Forced Preset User-Agent: {user_agent[:50]}...")
+        # For YCN, ALWAYS force the Chrome preset UA — no exceptions.
+        # Any non-browser UA (including app-specific ones) will get blocked by Cloudflare.
+        user_agent = HET140_PRESET["user_agent"]
+        logger.info(f"   -> Forced Preset User-Agent: {user_agent[:50]}...")
         
         if not referer:
             referer = HET140_PRESET["referer"]
@@ -2782,7 +3547,7 @@ async def hls_proxy(url: str, request: Request, user_agent: Optional[str] = Head
     is_playlist = target_url.split("?")[0].lower().endswith(".m3u8")
 
     headers = {
-        "User-Agent": user_agent or DEFAULT_UA,
+        "User-Agent": user_agent or DEFAULT_SCRAPER_UA,
         "Connection": "keep-alive",
         "Accept": "application/vnd.apple.mpegurl, application/x-mpegURL, */*" if is_playlist else "*/*",
     }
@@ -2811,8 +3576,7 @@ async def hls_proxy(url: str, request: Request, user_agent: Optional[str] = Head
             
             if "mpegurl" in content_type or target_url.split('?')[0].endswith(".m3u8"):
                 # It's a playlist, rewrite it
-                # Use absolute URL for proxy_base to ensure rewritten links are reachable
-                base_url = str(request.base_url).rstrip('/')
+                base_url = BACKEND_BASE_URL or str(request.base_url).rstrip('/')
                 proxy_base = f"{base_url}/api/hls/proxy"
                 rewritten = rewrite_m3u8(resp.text, target_url, proxy_base)
                 return Response(
@@ -2834,7 +3598,7 @@ async def hls_proxy(url: str, request: Request, user_agent: Optional[str] = Head
 
 def _build_proxy_headers(session: Dict[str, Any], accept: str = "*/*") -> Dict[str, str]:
     headers = {
-        "User-Agent": EXO_OR_BROWSER_UA,
+        "User-Agent": EXO_BROWSER_UA,
         "Accept": accept,
     }
     for k, v in (session.get("headers") or {}).items():
@@ -2938,7 +3702,7 @@ async def relay_stream(token: str):
     )
 
     headers = {
-        "User-Agent": EXO_OR_BROWSER_UA,
+        "User-Agent": EXO_BROWSER_UA,
         "Accept": "*/*",
     }
     
@@ -3032,7 +3796,7 @@ async def relay_stream(token: str):
 
     headers = {
         "Content-Type": "application/octet-stream",
-        "User-Agent": EXO_OR_BROWSER_UA,
+        "User-Agent": EXO_BROWSER_UA,
     }
 
     # Inject upstream-required DRM headers
@@ -3141,7 +3905,22 @@ async def admin_manage_user(
     if action == "UPDATE_TRIAL":
         if "seconds" not in payload:
             raise HTTPException(400, "Missing seconds")
-        update["trialRemaining"] = int(payload.get("seconds") or 0)
+        seconds_val = int(payload.get("seconds") or 0)
+        update["trialRemaining"] = seconds_val
+        # Always reset trialUsed when admin manually sets trial time.
+        # Without this, the app gets trial time but the trialUsed=True flag
+        # prevents it from displaying the timer or allowing access correctly.
+        update["trialUsed"] = seconds_val <= 0  # False if giving time, True if zeroing
+        update["trialPausedAt"] = None
+        # Kill all active sessions so the next session/start gets a fresh
+        # trialDeadlineAt stamped from the new trialRemaining value.
+        # Without this, old sessions use their old (or missing) deadline and
+        # expire immediately on the next heartbeat.
+        await sessions_col.update_many(
+            {"uuid": uuid_, "active": True},
+            {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "admin_trial_reset"}}
+        )
+        logger.info(f"🔄 Trial reset for {uuid_}: {seconds_val}s | trialUsed={update['trialUsed']} | old sessions killed")
 
     elif action == "UPGRADE":
         days = payload.get("days")
@@ -3177,16 +3956,37 @@ async def admin_manage_user(
         update["isPremium"] = False
         update["premiumUntil"] = None
         update["currentPackage"] = None
+        # Reset trial so the downgraded user gets a fresh trial window.
+        # Also kill active sessions so the app re-authenticates cleanly.
+        flags_for_downgrade = await get_admin_flags()
+        trial_secs = int(flags_for_downgrade.get("trialSeconds", 300) or 300)
+        update["trialRemaining"] = trial_secs
+        update["trialUsed"] = False
+        update["trialPausedAt"] = None
+        update["lastChannelId"] = None
+        update["downgradedAt"] = datetime.utcnow()
+        await sessions_col.update_many(
+            {"uuid": uuid_, "active": True},
+            {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "admin_downgrade"}}
+        )
+        logger.info(f"⬇️ Downgrade for {uuid_}: trial reset to {trial_secs}s, sessions killed")
 
     elif action in ("BLOCK", "UNBLOCK"):
         update["isBlocked"] = True if action == "BLOCK" else False
-        # When unblocking, also clear ip_guard records so the IP slot is freed
-        if action == "UNBLOCK":
-            await ip_guard_col.delete_many({"uuid": uuid_})
 
     # Also support direct field updates
     if "trialRemaining" in payload:
-        update["trialRemaining"] = int(payload["trialRemaining"])
+        secs = int(payload["trialRemaining"])
+        update["trialRemaining"] = secs
+        # Reset trialUsed consistent with UPDATE_TRIAL behaviour
+        if "trialUsed" not in update:
+            update["trialUsed"] = secs <= 0
+            update["trialPausedAt"] = None
+        if action not in ("UPDATE_TRIAL",):  # avoid double-killing sessions
+            await sessions_col.update_many(
+                {"uuid": uuid_, "active": True},
+                {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "admin_trial_direct"}}
+            )
 
     if "isPremium" in payload:
         update["isPremium"] = bool(payload["isPremium"])
@@ -3206,6 +4006,7 @@ async def admin_manage_user(
 
 
 
+@app.api_route("/api/clearkey/{kid_hex}/{key_hex}", methods=["GET", "POST"])
 @app.api_route("/api/clearkey/{kid_hex}/{key_hex}", methods=["GET", "POST"])
 async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
     """
@@ -3232,8 +4033,10 @@ async def clearkey_license_server(kid_hex: str, key_hex: str, request: Request):
 async def session_heartbeat(payload: dict):
     token = payload.get("token")
     uuid_ = payload.get("uuid")
-    seconds = payload.get("seconds", 30)
-    
+    # `seconds` from app is IGNORED for trial (server owns the clock).
+    # Clamped here to prevent any accidental future use.
+    _app_seconds = max(0, min(int(payload.get("seconds", 30) or 30), 300))
+
     if not token or not uuid_:
         raise HTTPException(400, "Token and UUID required")
     
@@ -3251,67 +4054,95 @@ async def session_heartbeat(payload: dict):
     device = await devices_col.find_one({"uuid": uuid_})
     if not device:
         raise HTTPException(404, "Device not found")
+    if _device_blocked(device):
+        await sessions_col.update_one(
+            {"token": token},
+            {"$set": {"active": False, "expiredAt": datetime.utcnow(), "killedBy": "device_blocked"}}
+        )
+        _assert_device_not_blocked(device, "Device blocked. Contact support.")
     
-    # ✅ FIX: Check if Premium has expired MID-STREAM
-    is_premium = device.get("isPremium", False)
-    premium_until = device.get("premiumUntil")
+    # ============================================================================
+    # 🔥 CRITICAL FIX: Proper Premium User Handling with Type Safety
+    # ============================================================================
     now = datetime.utcnow()
+    
+    # ✅ FIX #1: Explicit boolean type checking (handle string "true"/"false")
+    is_premium_raw = device.get("isPremium") or device.get("is_premium")
+    if isinstance(is_premium_raw, str):
+        is_premium = is_premium_raw.lower() in ("true", "1", "yes")
+    else:
+        is_premium = bool(is_premium_raw) if is_premium_raw is not None else False
+    
+    premium_until = device.get("premiumUntil") or device.get("premium_until")
+    
+    logger.info(f"🔍 Heartbeat Debug | uuid={uuid_} | is_premium={is_premium} | premium_until={premium_until}")
 
+    # ============================================================================
+    # PREMIUM USER VALIDATION
+    # ============================================================================
     if is_premium:
-        if premium_until and premium_until <= now:
-            logger.info(f"🚫 Premium expired mid-stream for {uuid_}")
-
-            TRIAL_AFTER_DOWNGRADE = 5
-
-            # ✅ Downgrade immediately + restore trial seconds to DB
-            await devices_col.update_one(
-                {"uuid": uuid_},
-                {"$set": {
+        # Validate that premium subscription is still active
+        if premium_until and isinstance(premium_until, datetime):
+            if premium_until <= now:
+                logger.warning(f"🚫 Premium subscription EXPIRED for {uuid_} | expired_at={premium_until}")
+                
+                TRIAL_AFTER_DOWNGRADE = 5
+                
+                # ✅ Downgrade immediately + restore trial seconds to DB
+                await devices_col.update_one(
+                    {"uuid": uuid_},
+                    {"$set": {
+                        "isPremium": False,
+                        "premiumUntil": None,
+                        "currentPackage": None,
+                        "trialRemaining": TRIAL_AFTER_DOWNGRADE,
+                        "trialUsed": False,
+                        "trialPausedAt": None,
+                        "lastChannelId": None,
+                        "downgradedAt": now
+                    }}
+                )
+                
+                logger.info(f"✅ Downgraded user {uuid_} and restored 5s trial")
+                
+                # Return trial seconds so app can continue
+                return {
+                    "success": True,
+                    "action": "CONTINUE",
                     "isPremium": False,
-                    "premiumUntil": None,
-                    "currentPackage": None,
                     "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-                    "trialUsed": False,
-                    "trialPausedAt": None,
-                    "lastChannelId": None,
-                    "downgradedAt": now
-                }}
-            )
-
-            # ✅ Return trial seconds so app can continue / show countdown (prevents black screen)
+                    "message": "Subscription expired. Trial started."
+                }
+            else:
+                # ✅ Premium is still valid - RETURN IMMEDIATELY
+                logger.info(f"✅ Premium VALID for {uuid_} | expires={premium_until}")
+                return {
+                    "success": True,
+                    "action": "CONTINUE",
+                    "isPremium": True,
+                    "trialRemaining": 0  # Premium users have NO trial counter
+                }
+        else:
+            # ✅ Premium is True but no expiry date found - GRANT ACCESS
+            # This shouldn't happen, but treat as valid premium to be safe
+            logger.warning(f"⚠️ Premium=true but missing premiumUntil for {uuid_} - granting access")
             return {
                 "success": True,
                 "action": "CONTINUE",
-                "isPremium": False,
-                "trialRemaining": TRIAL_AFTER_DOWNGRADE,
-                "message": "Subscription expired. Trial started."
+                "isPremium": True,
+                "trialRemaining": 0
             }
 
-        # User is valid premium
-        return {
-            "success": True,
-            "action": "CONTINUE",
-            "isPremium": True,
-            "trialRemaining": 0
-        }
+    # ============================================================================
+    # FREE USER TRIAL LOGIC (Only for non-premium users)
+    # ============================================================================
+    # NOTE: We intentionally do NOT reset the trial here when it hits 0.
+    # If trialUsed=True and trialRemaining=0, the user must see the paywall.
+    # The only time trial resets is after a real subscription downgrade (handled above).
 
-    # ✅ (Strongly recommended) Patch 3 — If any free user hits 0, snap back to 5
-    if not device.get("isPremium", False):
-        remaining = int(device.get("trialRemaining") or 0)
-        if remaining <= 0:
-            TRIAL_AFTER_DOWNGRADE = 5
-            await devices_col.update_one(
-                {"uuid": uuid_},
-                {"$set": {"trialRemaining": TRIAL_AFTER_DOWNGRADE, "trialUsed": False, "trialPausedAt": None}}
-            )
-            remaining = TRIAL_AFTER_DOWNGRADE
-            # Update device dict so subsequent logic uses the new value
-            device["trialRemaining"] = remaining
-            device["trialUsed"] = False
-
-    # --- BELOW IS EXISTING FREE/TRIAL LOGIC (UNCHANGED) ---
-    
-    # We need to know if the current session is for a premium channel
+    # ============================================================================
+    # CHECK IF WATCHING PREMIUM CHANNEL (Only matters for free users)
+    # ============================================================================
     last_channel_id = device.get("lastChannelId")
     is_watching_premium = False
     
@@ -3319,40 +4150,91 @@ async def session_heartbeat(payload: dict):
         channel = await channels_col.find_one({"id": last_channel_id})
         if channel and channel.get("is_premium"):
             is_watching_premium = True
+            logger.info(f"📺 User {uuid_} watching premium channel {last_channel_id}")
+    
+    # ✅ FIX #2: Premium users should NEVER hit trial/paywall logic
+    # Double-check that premium users don't continue to trial logic
+    if is_premium:
+        logger.warning(f"🚨 SAFETY BREACH: Premium user {uuid_} reached trial logic section! Returning CONTINUE.")
+        return {
+            "success": True,
+            "action": "CONTINUE",
+            "isPremium": True,
+            "trialRemaining": 0
+        }
     
     if is_watching_premium:
         trial_remaining = device.get("trialRemaining", 0)
         trial_used = device.get("trialUsed", False)
-        
+
+        logger.info(f"⏱️ Free user {uuid_} on premium channel | trial_used={trial_used} | trial_remaining={trial_remaining}s")
+
         if trial_used and trial_remaining <= 0:
+            logger.warning(f"❌ PAYWALL: Trial exhausted for {uuid_}")
+            await sessions_col.update_one(
+                {"_id": session["_id"]},
+                {"$set": {"active": False, "expiredAt": datetime.utcnow()}}
+            )
             return {
                 "success": False,
                 "action": "EXPIRED",
+                "isPremium": False,
                 "trialRemaining": 0,
                 "message": "Trial expired. Please upgrade to Premium."
             }
 
-        new_trial = max(0, trial_remaining - seconds)
-        
+        # ── SERVER-SIDE CLOCK ────────────────────────────────────────────────
+        # The app sends `seconds` elapsed — we IGNORE it completely.
+        # We use the deadline we stamped on the session at /session/start.
+        # A cloner sending seconds=0 or seconds=-99999 has zero effect.
+        # ────────────────────────────────────────────────────────────────────
+        now_hb = datetime.utcnow()
+        trial_deadline = session.get("trialDeadlineAt")
+
+        if trial_deadline and isinstance(trial_deadline, datetime):
+            new_trial = max(0, int((trial_deadline - now_hb).total_seconds()))
+        else:
+            # Fallback for legacy sessions without a deadline:
+            # tick down by a fixed 30s server-side — app cannot influence this.
+            new_trial = max(0, trial_remaining - 30)
+
         await devices_col.update_one(
             {"uuid": uuid_},
-            {"$set": {
-                "trialRemaining": new_trial,
-                "trialPausedAt": datetime.utcnow()
-            }}
+            {"$set": {"trialRemaining": new_trial, "trialPausedAt": now_hb}}
         )
-        
-        return {
-            "success": True if new_trial > 0 else False,
-            "action": "EXPIRED" if new_trial <= 0 else "CONTINUE",
-            "trialRemaining": new_trial,
-            "message": "Trial expired." if new_trial <= 0 else None
-        }
-    else:
-        # Watching free channel
+        logger.info(f"⏱️ Server-clock trial: {trial_remaining}s → {new_trial}s for {uuid_}")
+
+        if new_trial <= 0:
+            await devices_col.update_one(
+                {"uuid": uuid_},
+                {"$set": {"trialRemaining": 0, "trialUsed": True}}
+            )
+            await sessions_col.update_one(
+                {"_id": session["_id"]},
+                {"$set": {"active": False, "expiredAt": now_hb}}
+            )
+            logger.warning(f"❌ Server-side trial deadline hit for {uuid_}")
+            return {
+                "success": False,
+                "action": "EXPIRED",
+                "isPremium": False,
+                "trialRemaining": 0,
+                "message": "Trial expired. Please upgrade to Premium."
+            }
+
         return {
             "success": True,
             "action": "CONTINUE",
+            "trialRemaining": new_trial,
+            "message": None
+        }
+    else:
+        # Watching free channel
+        logger.info(f"✅ Free user {uuid_} on free channel - CONTINUE")
+        return {
+            "success": True,
+            "action": "CONTINUE",
+            "isPremium": False,
             "trialRemaining": device.get("trialRemaining", 0)
         }
 
@@ -3367,261 +4249,360 @@ async def playback_heartbeat_alias(payload: dict):
 
 
 # ╔══════════════════════════════════════════════════════════════════════════╗
-# ║                    ✅ SONICPESA INTEGRATION (PATCHED)                      ║
+# ║          ✅ DUAL PAYMENT PROVIDER: ZENOPAY + SONIC PESA                     ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
+
+# ── Helper: read active provider from DB (live switch, no restart needed) ──
+async def get_active_provider() -> str:
+    """Returns 'zeno' or 'sonic'. Reads DB first, falls back to env var."""
+    try:
+        cfg = await config_col.find_one({"name": "global"}) or {}
+        db_provider = (cfg.get("paymentProvider") or "").strip().lower()
+        if db_provider in ("zeno", "sonic"):
+            return db_provider
+    except Exception:
+        pass
+    return _PAYMENT_PROVIDER_FALLBACK
+
+
+# ── Helper: central upgrade logic — used by webhook + status + manual ───────
+async def _apply_upgrade(payment: dict, reference: str = "", extra_set: dict = None):
+    """
+    Upgrades a device after a confirmed payment.
+    Handles top-up: if already premium, extends from current expiry.
+    Returns the new premium_until datetime.
+    """
+    cfg = await config_col.find_one({"name": "global"}) or {}
+    pkg_id = payment.get("package")
+    package_doc = next(
+        (p for p in cfg.get("packages", []) if str(p.get("id")) == str(pkg_id)),
+        None
+    )
+    duration_td      = _duration_td_from_package_or_payment(package_doc, payment)
+    duration_seconds = int(duration_td.total_seconds())
+    duration_days    = max(1, int((duration_seconds + 86399) // 86400))
+    uuid_            = payment["uuid"]
+    now              = datetime.utcnow()
+
+    device = await devices_col.find_one({"uuid": uuid_})
+    if device and device.get("isPremium") and device.get("premiumUntil"):
+        base_date     = max(device["premiumUntil"], now)
+        premium_until = base_date + duration_td
+    else:
+        premium_until = now + duration_td
+
+    await devices_col.update_one(
+        {"uuid": uuid_},
+        {"$set": {
+            "isPremium":      True,
+            "premiumUntil":   premium_until,
+            "currentPackage": payment.get("package"),
+            "trialRemaining": 0,
+            "trialUsed":      True,
+            "upgradedAt":     now,
+        }}
+    )
+
+    payment_update = {
+        "status":           "COMPLETED",
+        "duration_seconds": duration_seconds,
+        "durationSeconds":  duration_seconds,
+        "duration_days":    duration_days,
+        "durationDays":     duration_days,
+        "updatedAt":        now,
+        "reference":        reference,
+    }
+    if extra_set:
+        payment_update.update(extra_set)
+
+    await payments_col.update_one(
+        {"_id": payment["_id"]},
+        {"$set": payment_update}
+    )
+    logger.info(f"🚀 Device {uuid_} upgraded until {premium_until} (ref={reference})")
+    return premium_until
+
+
 
 @app.post("/payment/start")
 async def start_payment(payload: dict):
     """
-    🚀 INITIATE SONICPESA PAYMENT
+    🚀 INITIATE PAYMENT — supports ZenoPay and Sonic Pesa.
+    Active provider is controlled by admin panel (stored in DB).
 
-    Keeps the existing app flow unchanged:
-      1. create local pending record
-      2. trigger SonicPesa Push USSD
-      3. return order_id for polling
+    Request body (unchanged — app sends same format for both providers):
+    {
+        "phone": "0744963858",
+        "package": "monthly_15k",
+        "uuid": "device-uuid-here",
+        "name": "John Doe",          # optional
+        "email": "user@example.com"  # optional
+    }
     """
-    phone = payload.get("phone") or payload.get("phone_number") or ""
+    phone            = payload.get("phone") or payload.get("phone_number") or ""
     normalized_phone = normalize_phone(phone) if phone else ""
-    package_id = payload.get("package")
-    uuid_ = payload.get("uuid")
-    name = payload.get("name", "pixtvmax User")
-    email = payload.get("email", "noemail@pixtv.app")
+    package_id       = payload.get("package")
+    uuid_            = payload.get("uuid")
+    name             = payload.get("name", APP_DISPLAY_NAME)
+    email            = payload.get("email", "noemail@pixtv.app")
 
     if not package_id or not uuid_:
         raise HTTPException(400, "package and uuid are required")
 
-    if not SONICPESA_API_KEY:
-        logger.error("❌ SONICPESA_API_KEY not configured!")
-        raise HTTPException(500, "Payment system not configured")
+    # Determine which provider to use
+    provider = await get_active_provider()
 
+    # Package lookup
     config = await config_col.find_one({"name": "global"})
     if not config:
         raise HTTPException(500, "Server config missing")
-
     package_doc = next(
-        (p for p in config.get("packages", []) if p.get("id") == package_id),
-        None
+        (p for p in config.get("packages", []) if p.get("id") == package_id), None
     )
     if not package_doc:
         raise HTTPException(404, "Invalid package")
 
-    amount = int(package_doc.get("price", 0))
-    duration_td = _duration_td_from_package_or_payment(package_doc, None)
+    amount           = int(package_doc.get("price", 0))
+    duration_td      = _duration_td_from_package_or_payment(package_doc, None)
     duration_seconds = int(duration_td.total_seconds())
     if duration_seconds <= 0:
         raise HTTPException(500, "Package duration misconfigured")
-
     duration_days = max(1, int((duration_seconds + 86399) // 86400))
-    internal_payment_id = str(uuid.uuid4())
 
-    logger.info(f"💳 Starting SonicPesa payment: internal_payment_id={internal_payment_id}, phone={normalized_phone}, amount={amount}")
+    # Always generate our own UUID as the primary order_id
+    order_id = str(uuid.uuid4())
+    logger.info(f"💳 Starting payment [{provider.upper()}]: order_id={order_id}, phone={phone}, amount={amount}")
 
+    # Save PENDING record
     try:
         await payments_col.insert_one({
-            "internal_payment_id": internal_payment_id,
-            "order_id": None,
-            "orderId": None,
-            "uuid": uuid_,
-            "package": package_id,
-            "package_name": package_doc.get("name"),
-            "duration_days": duration_days,
+            "order_id":        order_id,
+            "orderId":         order_id,
+            "uuid":            uuid_,
+            "package":         package_id,
+            "package_name":    package_doc.get("name"),
+            "duration_days":   duration_days,
             "duration_seconds": duration_seconds,
             "durationSeconds": duration_seconds,
-            "duration_unit": (package_doc.get("durationUnit") or package_doc.get("duration_unit")),
-            "duration_value": (package_doc.get("durationValue") or package_doc.get("duration_value")),
-            "phone": phone,
-            "buyer_phone": normalized_phone,
-            "buyer_name": name,
-            "buyer_email": email,
-            "amount": amount,
-            "currency": "TZS",
-            "status": "PENDING",
-            "gateway": "SONICPESA",
-            "createdAt": datetime.utcnow(),
-            "sonic_response": None,
-            "webhook_payload": None
+            "duration_unit":   (package_doc.get("durationUnit") or package_doc.get("duration_unit")),
+            "duration_value":  (package_doc.get("durationValue") or package_doc.get("duration_value")),
+            "phone":           phone,
+            "amount":          amount,
+            "currency":        "TZS",
+            "status":          "PENDING",
+            "provider":        provider,
+            "createdAt":       datetime.utcnow(),
+            "webhook_payload": None,
         })
     except Exception as e:
         logger.error(f"❌ Database error: {e}")
         raise HTTPException(500, "Failed to create payment record")
 
-    sonic_payload = {
-        "buyer_email": email,
-        "buyer_name": name,
-        "buyer_phone": normalized_phone,
-        "amount": amount,
-        "currency": "TZS"
-    }
+    # ════════════════════════════════════════════════════════════════════════
+    # PROVIDER BRANCH — both return the SAME response shape to the app
+    # ════════════════════════════════════════════════════════════════════════
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{SONICPESA_BASE_URL}/payment/create_order",
-                json=sonic_payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-KEY": SONICPESA_API_KEY,
-                },
-            )
-    except httpx.TimeoutException:
-        logger.error("❌ SonicPesa API timeout")
-        await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {"status": "FAILED", "error": "Gateway timeout"}}
-        )
-        raise HTTPException(504, "Payment gateway timeout. Please try again.")
-    except Exception as e:
-        logger.error(f"❌ SonicPesa API error: {e}")
-        await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {"status": "FAILED", "error": str(e)}}
-        )
-        raise HTTPException(502, "Payment gateway error")
+    # ── ZenoPay ─────────────────────────────────────────────────────────────
+    if provider == "zeno":
+        if not ZENO_API_KEY:
+            raise HTTPException(500, "ZenoPay not configured (ZENO_API_KEY missing)")
 
-    if resp.status_code not in (200, 201, 202):
-        error_msg = resp.text
-        logger.error(f"❌ SonicPesa rejected request: {error_msg}")
-        await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {
-                "status": "FAILED",
-                "sonic_response": error_msg,
-                "error": f"Gateway rejected with status {resp.status_code}"
-            }}
-        )
-        raise HTTPException(502, f"Payment gateway rejected request: {error_msg}")
-
-    try:
-        sonic_data = resp.json()
-        data = sonic_data.get("data") or {}
-        sonic_order_id = data.get("order_id")
-        reference = data.get("reference")
-        gateway_status = extract_sonicpesa_gateway_status(sonic_data) or "PENDING"
-        mapped_status = map_sonicpesa_status(gateway_status)
-
-        if not sonic_order_id:
-            await payments_col.update_one(
-                {"internal_payment_id": internal_payment_id},
-                {"$set": {
-                    "status": "FAILED",
-                    "sonic_response": sonic_data,
-                    "error": "Missing order_id in SonicPesa response"
-                }}
-            )
-            raise HTTPException(502, "Invalid response from payment gateway")
-
-        await payments_col.update_one(
-            {"internal_payment_id": internal_payment_id},
-            {"$set": {
-                "order_id": sonic_order_id,
-                "orderId": sonic_order_id,
-                "reference": reference,
-                "gateway_status": gateway_status,
-                "status": mapped_status if mapped_status != "COMPLETED" else "PENDING",
-                "sonic_response": sonic_data,
-                "updatedAt": datetime.utcnow(),
-            }}
-        )
-
-        logger.info(f"✅ SonicPesa payment initiated successfully: order_id={sonic_order_id}")
-        return {
-            "order_id": sonic_order_id,
-            "reference": reference,
-            "status": "PENDING",
-            "message": sonic_data.get("message", "USSD request sent. Please confirm on your phone.")
+        zeno_payload = {
+            "order_id":    order_id,
+            "buyer_name":  name,
+            "buyer_phone": normalized_phone,
+            "buyer_email": email,
+            "amount":      amount,
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"❌ Failed to parse SonicPesa response: {e}")
-        raise HTTPException(502, "Invalid response from payment gateway")
+        if ZENO_WEBHOOK_URL:
+            zeno_payload["webhook_url"] = ZENO_WEBHOOK_URL
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                logger.info(f"📤 ZenoPay request: {zeno_payload}")
+                resp = await client.post(
+                    "https://zenoapi.com/api/payments/mobile_money_tanzania",
+                    json=zeno_payload,
+                    headers={"Content-Type": "application/json", "x-api-key": ZENO_API_KEY},
+                )
+                logger.info(f"📥 ZenoPay response: {resp.status_code} {resp.text}")
+        except httpx.TimeoutException:
+            await payments_col.update_one({"order_id": order_id}, {"$set": {"status": "FAILED", "error": "Gateway timeout"}})
+            raise HTTPException(504, "Payment gateway timeout. Please try again.")
+        except Exception as e:
+            await payments_col.update_one({"order_id": order_id}, {"$set": {"status": "FAILED", "error": str(e)}})
+            raise HTTPException(502, "Payment gateway error")
+
+        if resp.status_code not in (200, 201, 202):
+            await payments_col.update_one(
+                {"order_id": order_id},
+                {"$set": {"status": "FAILED", "zeno_response": resp.text,
+                          "error": f"Gateway rejected {resp.status_code}"}}
+            )
+            raise HTTPException(502, f"Payment gateway rejected request: {resp.text}")
+
+        try:
+            zeno_data = resp.json()
+            await payments_col.update_one({"order_id": order_id}, {"$set": {"zeno_response": zeno_data}})
+            logger.info(f"✅ ZenoPay initiated: {zeno_data}")
+            # ↓ Same response shape the app already expects
+            return {
+                "order_id": order_id,
+                "status":   "PENDING",
+                "message":  zeno_data.get("message", "USSD request sent. Please confirm on your phone."),
+            }
+        except Exception:
+            raise HTTPException(502, "Invalid response from ZenoPay")
+
+    # ── Sonic Pesa ───────────────────────────────────────────────────────────
+    elif provider == "sonic":
+        if not SONICPESA_API_KEY:
+            raise HTTPException(500, "Sonic Pesa not configured (SONICPESA_API_KEY missing)")
+
+        sonic_payload = {
+            "buyer_email": email,
+            "buyer_name":  name,
+            "buyer_phone": normalized_phone,
+            "amount":      amount,
+            "currency":    "TZS",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                logger.info(f"📤 Sonic Pesa request: {sonic_payload}")
+                resp = await client.post(
+                    f"{SONICPESA_BASE_URL}/payment/create_order",
+                    json=sonic_payload,
+                    headers={"Content-Type": "application/json", "X-API-KEY": SONICPESA_API_KEY},
+                )
+                logger.info(f"📥 Sonic Pesa response: {resp.status_code} {resp.text}")
+        except httpx.TimeoutException:
+            await payments_col.update_one({"order_id": order_id}, {"$set": {"status": "FAILED", "error": "Gateway timeout"}})
+            raise HTTPException(504, "Payment gateway timeout. Please try again.")
+        except Exception as e:
+            await payments_col.update_one({"order_id": order_id}, {"$set": {"status": "FAILED", "error": str(e)}})
+            raise HTTPException(502, "Payment gateway error")
+
+        if resp.status_code not in (200, 201, 202):
+            await payments_col.update_one(
+                {"order_id": order_id},
+                {"$set": {"status": "FAILED", "sonic_response": resp.text,
+                          "error": f"Gateway rejected {resp.status_code}"}}
+            )
+            raise HTTPException(502, f"Sonic Pesa rejected request: {resp.text}")
+
+        try:
+            sonic_data     = resp.json()
+            sonic_order_id = sonic_data.get("data", {}).get("order_id")   # e.g. "sp_69be15e08c830"
+            await payments_col.update_one(
+                {"order_id": order_id},
+                {"$set": {"sonic_response": sonic_data, "sonic_order_id": sonic_order_id}}
+            )
+            logger.info(f"✅ Sonic Pesa initiated: order_id={order_id}, sonic_order_id={sonic_order_id}")
+            # ↓ SAME response shape as ZenoPay — app gets identical format
+            return {
+                "order_id": order_id,   # our UUID, used for all polling
+                "status":   "PENDING",
+                "message":  sonic_data.get("message", "USSD request sent. Please confirm on your phone."),
+            }
+        except Exception:
+            raise HTTPException(502, "Invalid response from Sonic Pesa")
+
+    else:
+        raise HTTPException(500, f"Unknown payment provider: {provider}")
+
 
 @app.get("/payment/status/{order_id}")
 async def payment_status(order_id: str):
     """
     📊 CHECK PAYMENT STATUS
-    Keeps the existing frontend contract intact while polling SonicPesa as fallback.
+    Works for both ZenoPay and Sonic Pesa — response shape is identical.
+    Auto-heals: if still PENDING, polls the provider directly.
     """
-    latest_payment = await find_payment_by_order_id(order_id)
-    if not latest_payment:
+    cursor = payments_col.find({
+        "$or": [{"orderId": order_id}, {"order_id": order_id}]
+    }).sort("createdAt", -1)
+    payments_list = await cursor.to_list(length=1)
+    if not payments_list:
         raise HTTPException(404, "Payment not found")
 
+    latest_payment = payments_list[0]
     current_status = latest_payment.get("status", "PENDING")
+    provider       = latest_payment.get("provider", "zeno")  # default zeno for old records
 
-    if current_status == "PENDING" and SONICPESA_API_KEY:
+    # Auto-heal: if PENDING, poll the gateway
+    if current_status == "PENDING":
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(
-                    f"{SONICPESA_BASE_URL}/payment/order_status",
-                    json={"order_id": order_id},
-                    headers={
-                        "Content-Type": "application/json",
-                        "X-API-KEY": SONICPESA_API_KEY,
-                    },
-                )
-
-            if resp.status_code == 200:
-                sonic_data = resp.json()
-                gateway_status = extract_sonicpesa_gateway_status(sonic_data)
-                mapped_status = map_sonicpesa_status(gateway_status)
-                data = sonic_data.get("data") if isinstance(sonic_data.get("data"), dict) else {}
-
-                update_data = {
-                    "gateway_status": gateway_status or latest_payment.get("gateway_status"),
-                    "sonic_status_response": sonic_data,
-                    "updatedAt": datetime.utcnow(),
-                }
-                if data.get("reference"):
-                    update_data["reference"] = data.get("reference")
-                if data.get("transid"):
-                    update_data["transid"] = data.get("transid")
-                if data.get("channel"):
-                    update_data["channel"] = data.get("channel")
-
-                if mapped_status == "COMPLETED":
-                    latest_payment = await complete_payment_and_upgrade_user(
-                        latest_payment,
-                        gateway_payload=sonic_data,
-                        source="status_poll"
+            if provider == "zeno" and ZENO_API_KEY:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(
+                        f"https://zenoapi.com/api/payments/check_status/{order_id}",
+                        headers={"x-api-key": ZENO_API_KEY}
                     )
-                    current_status = "COMPLETED"
-                else:
-                    if mapped_status == "FAILED":
-                        update_data["status"] = "FAILED"
-                        current_status = "FAILED"
-                    else:
-                        current_status = latest_payment.get("status", "PENDING")
-                    await payments_col.update_one({"_id": latest_payment["_id"]}, {"$set": update_data})
-            else:
-                logger.warning(f"⚠️ SonicPesa order_status returned {resp.status_code}: {resp.text}")
+                    if resp.status_code == 200:
+                        zeno_status = resp.json().get("payment_status", "").upper()
+                        if zeno_status == "COMPLETED":
+                            logger.info(f"✅ Auto-heal [ZenoPay] COMPLETED: {order_id}")
+                            await _apply_upgrade(latest_payment, extra_set={"auto_healed": True})
+                            current_status = "COMPLETED"
+                    elif resp.status_code == 404:
+                        logger.info(f"ℹ️ ZenoPay: {order_id} not yet indexed")
+
+            elif provider == "sonic" and SONICPESA_API_KEY:
+                sonic_order_id = latest_payment.get("sonic_order_id")
+                if sonic_order_id:
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        resp = await client.post(
+                            f"{SONICPESA_BASE_URL}/payment/order_status",
+                            json={"order_id": sonic_order_id},
+                            headers={"Content-Type": "application/json", "X-API-KEY": SONICPESA_API_KEY},
+                        )
+                        if resp.status_code == 200:
+                            data         = resp.json().get("data", {})
+                            sonic_status = data.get("payment_status", "").upper()
+                            if sonic_status == "SUCCESS":
+                                logger.info(f"✅ Auto-heal [Sonic] SUCCESS: {order_id}")
+                                await _apply_upgrade(
+                                    latest_payment,
+                                    reference=data.get("reference", ""),
+                                    extra_set={"sonic_transid": data.get("transid"), "auto_healed": True}
+                                )
+                                current_status = "COMPLETED"
         except Exception as e:
-            logger.error(f"⚠️ SonicPesa status polling failed: {e}")
+            logger.error(f"⚠️ Auto-check failed [{provider}]: {e}")
 
-    final_status_for_app = "SUCCESS" if current_status == "COMPLETED" else current_status
+    # Map internal COMPLETED → SUCCESS (what the app expects)
+    final_status = "SUCCESS" if current_status == "COMPLETED" else current_status
+
     device = await devices_col.find_one({"uuid": latest_payment["uuid"]})
-
     return {
-        "order_id": order_id,
-        "status": final_status_for_app,
-        "amount": latest_payment.get("amount"),
-        "package": latest_payment.get("package_name"),
-        "isPremium": device.get("isPremium", False) if device else False,
+        "order_id":     order_id,
+        "status":       final_status,
+        "amount":       latest_payment.get("amount"),
+        "package":      latest_payment.get("package_name"),
+        "isPremium":    device.get("isPremium", False) if device else False,
         "premiumUntil": device.get("premiumUntil").isoformat() if device and device.get("premiumUntil") else None,
-        "createdAt": latest_payment.get("createdAt").isoformat() if latest_payment.get("createdAt") else None
+        "createdAt":    latest_payment.get("createdAt").isoformat() if latest_payment.get("createdAt") else None,
     }
+
 
 @app.post("/payment/manual-upgrade/{order_id}")
 async def manual_upgrade_trigger(order_id: str):
     """
-    🔧 MANUAL UPGRADE TRIGGER (Fallback if webhook fails)
-
-    Keeps the existing endpoint, but verifies payment with SonicPesa.
+    🔧 MANUAL UPGRADE TRIGGER — fallback if webhook was missed.
+    Supports both ZenoPay and Sonic Pesa.
     """
-    logger.info(f"🔧 Manual SonicPesa upgrade triggered for order_id: {order_id}")
+    logger.info(f"🔧 Manual upgrade triggered: {order_id}")
 
-    payment = await find_payment_by_order_id(order_id)
-    if not payment:
+    cursor = payments_col.find({
+        "$or": [{"orderId": order_id}, {"order_id": order_id}]
+    }).sort("createdAt", -1)
+    payments_list = await cursor.to_list(length=1)
+    if not payments_list:
         raise HTTPException(404, "Payment not found")
+
+    payment  = payments_list[0]
+    provider = payment.get("provider", "zeno")
 
     if payment.get("status") == "COMPLETED":
         device = await devices_col.find_one({"uuid": payment["uuid"]})
@@ -3631,130 +4612,193 @@ async def manual_upgrade_trigger(order_id: str):
             "message": "User already upgraded"
         }
 
-    if not SONICPESA_API_KEY:
-        raise HTTPException(500, "Payment system not configured")
-
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{SONICPESA_BASE_URL}/payment/order_status",
-                json={"order_id": order_id},
-                headers={
-                    "Content-Type": "application/json",
-                    "X-API-KEY": SONICPESA_API_KEY,
-                },
-            )
-
-        if resp.status_code != 200:
-            logger.error(f"❌ SonicPesa status check failed: {resp.status_code} - {resp.text}")
-            raise HTTPException(502, "Could not verify payment status")
-
-        sonic_data = resp.json()
-        gateway_status = extract_sonicpesa_gateway_status(sonic_data)
-        mapped_status = map_sonicpesa_status(gateway_status)
-
-        if mapped_status != "COMPLETED":
-            if mapped_status == "FAILED":
-                await payments_col.update_one(
-                    {"_id": payment["_id"]},
-                    {"$set": {
-                        "status": "FAILED",
-                        "gateway_status": gateway_status,
-                        "updatedAt": datetime.utcnow(),
-                        "sonic_status_response": sonic_data,
-                    }}
+    # ── ZenoPay ───────────────────────────────────────────────────────────
+    if provider == "zeno":
+        if not ZENO_API_KEY:
+            raise HTTPException(500, "Payment system not configured")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(
+                    f"https://zenoapi.com/api/payments/check_status/{order_id}",
+                    headers={"x-api-key": ZENO_API_KEY}
                 )
-            return {
-                "status": "not_completed",
-                "payment_status": gateway_status or "PENDING",
-                "message": "Payment not yet completed"
-            }
+            if resp.status_code == 404:
+                return {"status": "not_completed", "payment_status": "PENDING", "message": "Payment not yet indexed by gateway"}
+            if resp.status_code != 200:
+                raise HTTPException(502, "Could not verify payment status")
+            payment_status = resp.json().get("payment_status", "").upper()
+            if payment_status != "COMPLETED":
+                return {"status": "not_completed", "payment_status": payment_status, "message": "Payment not yet completed"}
+            premium_until = await _apply_upgrade(payment, extra_set={"manual_upgrade": True})
+            return {"status": "upgraded", "isPremium": True, "premiumUntil": premium_until.isoformat(), "message": "Upgrade successful"}
+        except httpx.TimeoutException:
+            raise HTTPException(504, "Payment verification timeout")
+        except Exception as e:
+            logger.error(f"❌ Manual upgrade error [zeno]: {e}")
+            raise HTTPException(500, "Upgrade failed")
 
-        payment = await complete_payment_and_upgrade_user(
-            payment,
-            gateway_payload=sonic_data,
-            source="manual_upgrade"
-        )
+    # ── Sonic Pesa ────────────────────────────────────────────────────────
+    elif provider == "sonic":
+        if not SONICPESA_API_KEY:
+            raise HTTPException(500, "Payment system not configured")
+        sonic_order_id = payment.get("sonic_order_id")
+        if not sonic_order_id:
+            raise HTTPException(500, "sonic_order_id missing — cannot verify with Sonic Pesa")
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{SONICPESA_BASE_URL}/payment/order_status",
+                    json={"order_id": sonic_order_id},
+                    headers={"Content-Type": "application/json", "X-API-KEY": SONICPESA_API_KEY},
+                )
+            if resp.status_code != 200:
+                raise HTTPException(502, "Could not verify payment status with Sonic Pesa")
+            data           = resp.json().get("data", {})
+            payment_status = data.get("payment_status", "").upper()
+            if payment_status != "SUCCESS":
+                return {"status": "not_completed", "payment_status": payment_status, "message": "Payment not yet completed"}
+            premium_until = await _apply_upgrade(
+                payment,
+                reference=data.get("reference", ""),
+                extra_set={"sonic_transid": data.get("transid"), "manual_upgrade": True}
+            )
+            return {"status": "upgraded", "isPremium": True, "premiumUntil": premium_until.isoformat(), "message": "Upgrade successful"}
+        except httpx.TimeoutException:
+            raise HTTPException(504, "Payment verification timeout")
+        except Exception as e:
+            logger.error(f"❌ Manual upgrade error [sonic]: {e}")
+            raise HTTPException(500, "Upgrade failed")
 
-        logger.info(f"✅ Manual upgrade successful for {payment['uuid']}")
-        return {
-            "status": "upgraded",
-            "isPremium": True,
-            "premiumUntil": payment.get("premiumUntil").isoformat() if payment.get("premiumUntil") else None,
-            "message": "Upgrade successful"
-        }
-    except HTTPException:
-        raise
-    except httpx.TimeoutException:
-        raise HTTPException(504, "Payment verification timeout")
-    except Exception as e:
-        logger.error(f"❌ Manual SonicPesa upgrade error: {e}")
-        raise HTTPException(500, "Upgrade failed")
+    else:
+        raise HTTPException(500, f"Unknown provider: {provider}")
 
-# ==========================================
-# SonicPesa webhook aliases
-# ==========================================
-@app.post("/webhooks/sonic")
-@app.post("/webhooks/zeno")      # Backward compatibility alias
-@app.post("/payment-webhook")    # Keep this for backward compatibility
-async def sonicpesa_webhook(request: Request):
-    """🔔 SONICPESA WEBHOOK HANDLER"""
-    logger.info("=" * 80)
-    logger.info("🔔 SONICPESA WEBHOOK RECEIVED - Starting processing")
-    logger.info("=" * 80)
 
-    raw_body = await request.body()
-    signature = request.headers.get("X-SonicPesa-Signature")
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║                         🔔 PAYMENT WEBHOOKS                                ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+# ── ZenoPay Webhook ──────────────────────────────────────────────────────────
+# ── PayWay aliases — app uses /payway/* branding ──────────────────────────
+@app.post("/payway/start")
+async def payway_start(payload: dict = Body(...)):
+    """Alias for /payment/start — same logic, PayWay-branded endpoint."""
+    return await start_payment(payload)
+
+@app.get("/payway/status/{order_id}")
+async def payway_status(order_id: str):
+    """Alias for /payment/status — same logic, PayWay-branded endpoint."""
+    return await payment_status(order_id)
+
+@app.post("/payway/webhooks/zeno")
+async def payway_zeno_webhook(request: Request):
+    """PayWay-branded Zeno webhook alias."""
+    return await zenopay_webhook(request)
+
+@app.post("/payway/webhooks/sonic")
+async def payway_sonic_webhook(request: Request):
+    """PayWay-branded Sonic webhook alias."""
+    return await sonic_webhook(request)
+
+
+@app.post("/webhooks/zeno")
+@app.post("/payment-webhook")    # backward compatibility
+async def zenopay_webhook(request: Request):
+    """🔔 ZENOPAY WEBHOOK"""
+    logger.info("=" * 60 + " ZENO WEBHOOK RECEIVED")
 
     try:
-        payload = json.loads(raw_body.decode("utf-8"))
-        logger.info(f"📦 SonicPesa Webhook Payload: {payload}")
+        if "application/json" in request.headers.get("content-type", ""):
+            payload = await request.json()
+        else:
+            payload = dict(await request.form())
+        logger.info(f"📦 Zeno Payload: {payload}")
     except Exception as e:
-        logger.error(f"❌ Could not parse SonicPesa webhook body: {e}")
-        return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid JSON payload"})
+        logger.error(f"❌ Zeno webhook parse error: {e}")
+        return {"status": "error", "message": "Parse error"}
 
-    if not verify_sonicpesa_signature(raw_body, signature or ""):
-        return JSONResponse(status_code=401, content={"status": "error", "message": "Invalid signature"})
+    received_key = request.headers.get("x-api-key")
+    if received_key and received_key != ZENO_API_KEY:
+        logger.warning("⚠️ Zeno webhook key mismatch — proceeding anyway")
 
-    order_id = payload.get("order_id")
-    event_name = (payload.get("event") or "").strip().lower()
-    gateway_status = extract_sonicpesa_gateway_status(payload)
-    mapped_status = map_sonicpesa_status(gateway_status)
+    order_id       = payload.get("order_id")
+    payment_status = (payload.get("payment_status") or "").upper()
+    reference      = payload.get("reference", "")
 
-    if not order_id:
-        logger.warning("⚠️ SonicPesa webhook missing order_id")
-        return {"status": "ignored", "reason": "missing order_id"}
+    if not order_id or not payment_status:
+        return {"status": "ignored", "reason": "missing fields"}
 
-    payment = await find_payment_by_order_id(order_id)
-    if not payment:
-        logger.warning(f"⚠️ Payment not found for SonicPesa order_id: {order_id}")
+    cursor = payments_col.find({"$or": [{"orderId": order_id}, {"order_id": order_id}]}).sort("createdAt", -1)
+    payments_list = await cursor.to_list(length=1)
+    if not payments_list:
+        logger.warning(f"⚠️ Zeno webhook: order {order_id} not found in DB")
         return {"status": "ignored", "reason": "order_id not found in DB"}
 
+    payment = payments_list[0]
     if payment.get("status") == "COMPLETED":
-        logger.info(f"✅ Payment {order_id} already processed")
         return {"status": "already processed"}
 
-    if mapped_status == "COMPLETED" and event_name == "payment.completed":
-        logger.info(f"✅ SonicPesa payment completed: {order_id}")
-        await complete_payment_and_upgrade_user(payment, gateway_payload=payload, source="webhook")
-        return {"status": "ok"}
+    if payment_status == "COMPLETED":
+        await _apply_upgrade(payment, reference=reference, extra_set={"webhook_payload": payload})
+        logger.info(f"✅ Zeno webhook: device upgraded for {order_id}")
 
-    update_data = {
-        "webhook_payload": payload,
-        "gateway_status": gateway_status or payment.get("gateway_status"),
-        "updatedAt": datetime.utcnow(),
-    }
-    if payload.get("reference"):
-        update_data["reference"] = payload.get("reference")
-    if payload.get("transid"):
-        update_data["transid"] = payload.get("transid")
-    if payload.get("channel"):
-        update_data["channel"] = payload.get("channel")
-    if mapped_status == "FAILED":
-        update_data["status"] = "FAILED"
-
-    await payments_col.update_one({"_id": payment["_id"]}, {"$set": update_data})
     return {"status": "ok"}
+
+
+# ── Sonic Pesa Webhook ───────────────────────────────────────────────────────
+@app.post("/webhooks/sonic")
+async def sonic_webhook(request: Request):
+    """🔔 SONIC PESA WEBHOOK"""
+    logger.info("=" * 60 + " SONIC WEBHOOK RECEIVED")
+
+    raw_body = await request.body()
+
+    # Optional HMAC-SHA256 signature check
+    if SONICPESA_SECRET_KEY:
+        sig_header = request.headers.get("X-SonicPesa-Signature", "")
+        expected   = hmac.new(
+            SONICPESA_SECRET_KEY.encode(), raw_body, hashlib.sha256
+        ).hexdigest()
+        if sig_header and sig_header != expected:
+            logger.warning("⚠️ Sonic webhook signature mismatch — rejecting")
+            raise HTTPException(401, "Invalid webhook signature")
+
+    try:
+        payload = json.loads(raw_body)
+        logger.info(f"📦 Sonic Payload: {payload}")
+    except Exception as e:
+        logger.error(f"❌ Sonic webhook parse error: {e}")
+        return {"status": "error", "message": "Parse error"}
+
+    # Sonic uses "status" field (not "payment_status")
+    sonic_order_id = payload.get("order_id")           # Sonic's sp_xxx ID
+    payment_status = (payload.get("status") or "").upper()
+    reference      = payload.get("reference", "")
+    transid        = payload.get("transid", "")
+
+    if not sonic_order_id or not payment_status:
+        return {"status": "ignored", "reason": "missing fields"}
+
+    # Look up by sonic_order_id
+    cursor = payments_col.find({"sonic_order_id": sonic_order_id}).sort("createdAt", -1)
+    payments_list = await cursor.to_list(length=1)
+    if not payments_list:
+        logger.warning(f"⚠️ Sonic webhook: sonic_order_id {sonic_order_id} not found in DB")
+        return {"status": "ignored", "reason": "sonic_order_id not found in DB"}
+
+    payment = payments_list[0]
+    if payment.get("status") == "COMPLETED":
+        return {"status": "already processed"}
+
+    if payment_status == "SUCCESS":
+        await _apply_upgrade(
+            payment,
+            reference=reference,
+            extra_set={"sonic_transid": transid, "webhook_payload": payload}
+        )
+        logger.info(f"✅ Sonic webhook: device upgraded for sonic_order_id={sonic_order_id}")
+
+    return {"status": "ok"}
+
 
 @app.get("/payment/check-upgrade/{uuid}")
 async def check_upgrade_status(uuid: str):
@@ -3910,17 +4954,3 @@ async def admin_payments(
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
-@app.get("/admin/ip-registry")
-async def admin_ip_registry(admin: dict = Depends(get_current_admin)):
-    """Admin endpoint to view all IP guard entries."""
-    ip_entries = await ip_guard_col.find().to_list(None)
-    return [serialize_doc(entry, for_admin=True) for entry in ip_entries]
-
-@app.get("/admin/payment-provider")
-async def admin_payment_provider(admin: dict = Depends(get_current_admin)):
-    """Admin endpoint for payment provider configuration (placeholder)."""
-    # This is a placeholder. Actual implementation would involve fetching/updating
-    # payment provider configurations from a dedicated collection.
-    return {"message": "Payment provider configuration endpoint. Implementation pending."}
