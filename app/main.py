@@ -1471,6 +1471,7 @@ _SIG_EXEMPT_PREFIXES = (
     "/webhooks",
     "/payway/webhooks",    # PayWay-branded webhook aliases
     "/payment-webhook",
+    "/device/register",    # Bootstrap endpoint — app has no token yet at registration
     "/api/schedules",
     "/api/vipindi",
     "/api/channels",      # admin panel still uses this legacy path
